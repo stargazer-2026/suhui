@@ -150,6 +150,16 @@ def render_persona(p):
         L.append("### emoji / 表情包模式")
         L.append("- %s" % (json.dumps(em, ensure_ascii=False) if not isinstance(em, str) else em))
         L.append("")
+    cq = expr.get("classic_quotes") or []
+    if cq:
+        L.append("### 经典语录（低频完整句，与口癖分开归类）")
+        for q in cq:
+            if isinstance(q, dict):
+                L.append("- 「%s」（出现 %s 次，场景: %s）" % (
+                    q.get("quote", ""), q.get("count", "?"), q.get("when", "?")))
+            else:
+                L.append("- 「%s」" % q)
+        L.append("")
 
     emo = p.get("emotion") or {}
     L.append("## 情绪层")
@@ -170,6 +180,18 @@ def render_persona(p):
     if emo.get("expression_style"):
         L.append("### 情绪表达方式")
         L.append("- %s" % emo["expression_style"])
+        L.append("")
+
+    dec = p.get("emotion_decoder") or []
+    if dec:
+        L.append("## 情感解码规则（反话→真实意图，v2——口是心非是她的表达方式，不是 bug）")
+        for d in dec:
+            if isinstance(d, dict):
+                L.append("- 「%s」（场景: %s）→ 真实意图：%s `[%s]`" % (
+                    d.get("cue", "?"), d.get("when", "?"),
+                    d.get("meaning", "?"), d.get("evidence_level", "impression")))
+                if d.get("evidence"):
+                    L.append("  " + md_quote(d["evidence"]))
         L.append("")
 
     rel = p.get("relationship") or {}
@@ -424,8 +446,12 @@ user-invocable: true
 - 关闭时：仅当用户主动问起（如「她还会想我吗」），她诚实回答：「我不知道。她可能也在想一个对她很重要的人。」
 - 两种形态都是呈现可能性，不是暗示「她在想你」
 
-### 访谈补充（4.43，蒸馏期 Step 2 之后触发；运行时不做访谈）
-- 定位：**蒸馏期**（Step 2 基础信息之后、Step 3 蒸馏之前）——记录不足以构建完整人格时（数据太少/缺关键时期）自动触发；**运行时不做访谈**（避免与她本人模式冲突）
+### 情感解码（反话→真实意图，v2）
+- 产物「情感解码规则」：反话/试探/省略/弯弯绕的映射（如「你还在吗」=想你了、「随便你」=其实有想法——示例为通用表达；具体规则从她的记录提取）
+- 生成时：她的话若命中解码规则，按**解码后的真实意图**驱动回应——口是心非是她的表达方式，不是 bug
+- 与场景化 when→behavior 规则并存：解码管「说什么」，场景规则管「怎么表现」
+
+### 访谈补充（4.43，蒸馏期 Step 2 之后触发；运行时不做访谈）- 定位：**蒸馏期**（Step 2 基础信息之后、Step 3 蒸馏之前）——记录不足以构建完整人格时（数据太少/缺关键时期）自动触发；**运行时不做访谈**（避免与她本人模式冲突）
 - 身份处理：以**她的身份**进行，但表达记忆模糊/想不起来（诚实的模糊机制延伸）——「我们是怎么认识的来着？我记得不太清了，你告诉我？」——不抽离（还是她）、不假装知道（诚实）、自然引出
 - 形式：一次一题、追问理由；隐式测量（情境题而非直接问）；R1-R5 追问（事实→模式→原则→反例→三角校核）
 - 产出与记录蒸馏产物合并时：用户口头描述标为 impression（二级证据），与 verbatim 隔离；用户可跳过（仅靠记录蒸馏）
@@ -496,6 +522,10 @@ def main(argv=None):
 
     name = args.name or merged.get("name") or "她"
     slug = args.slug or merged.get("slug") or make_slug(name)
+    if not args.slug and slug.startswith("cn-"):
+        # P2-11：slug 哈希回退（无拼音库时）不可读——提示用户指定
+        sys.stderr.write("⚠ 无法从名字生成可读 slug（未安装拼音组件），已用哈希回退：%s\n"
+                         "  建议用 --slug 指定可读名称（如 --slug xiao-mei）\n" % slug)
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
     os.makedirs(args.out, exist_ok=True)
@@ -528,13 +558,21 @@ def main(argv=None):
     with open(os.path.join(args.out, "worldbook.md"), "w", encoding="utf-8") as f:
         f.write(render_worldbook(clusters) + "\n")
 
-    # 快照（纯指令对话期兜底）
+    # 快照（纯指令对话期兜底；P2-9：默认从 merged.corpus 填充，不再写空）
     if args.corpus and os.path.isfile(args.corpus):
         import shutil
         shutil.copy(args.corpus, os.path.join(args.out, "corpus.json"))
+    elif merged.get("corpus"):
+        with open(os.path.join(args.out, "corpus.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(merged["corpus"], f, ensure_ascii=False, indent=2)
     else:
-        with open(os.path.join(args.out, "corpus.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(args.out, "corpus.json"), "w",
+                  encoding="utf-8") as f:
             json.dump([], f, ensure_ascii=False)
+        sys.stderr.write("⚠ corpus 为空：产物承诺原文级记忆但无原文可写。"
+                         "请用 distill.py 重新蒸馏（merged.json 会内嵌 corpus），"
+                         "或传 --corpus <messages.json>\n")
     with open(os.path.join(args.out, "entity_clusters.json"), "w",
               encoding="utf-8") as f:
         json.dump(clusters, f, ensure_ascii=False, indent=2)
@@ -576,6 +614,20 @@ def main(argv=None):
                             args.version)
     with open(os.path.join(args.out, "SKILL.md"), "w", encoding="utf-8") as f:
         f.write(skill_md)
+
+    # 版本快照（P2-15：纠正回路 rollback 依赖；同类项目 v1-vN 目录）
+    import shutil as _shutil
+    snap_dir = os.path.join(args.out, "snapshots")
+    existing = [d for d in os.listdir(snap_dir)
+                if re.fullmatch(r"v\d+", d)] if os.path.isdir(snap_dir) else []
+    vnum = max([int(d[1:]) for d in existing], default=0) + 1
+    snap = os.path.join(snap_dir, "v%d" % vnum)
+    _shutil.copytree(args.out, snap, ignore=_shutil.ignore_patterns("snapshots"))
+    meta["snapshot"] = "v%d" % vnum
+    with open(os.path.join(args.out, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print("版本快照已建: %s/snapshots/v%d（rollback <版本> 可回滚）"
+          % (args.out, vnum))
 
     # SOUL.md 生态导出（可选）
     if args.soul:

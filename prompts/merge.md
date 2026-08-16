@@ -43,11 +43,17 @@
     "expression": {
       "catchphrases": [{"phrase": "口癖", "freq": 数值, "when": "场景", "examples": ["[原文]"],
                         "evidence_level": "verbatim|artifact"}],
+      "classic_quotes": [{"quote": "经典语录（低频完整句）", "count": 数值,
+                          "when": "场景"}],
       "sentence_length": {"median_chars": 数值, "percentiles": {"50": 数值}, "style": "描述",
                           "evidence_level": "artifact"},
       "punctuation": ["高频标点"],
       "emoji_pattern": {"rate": "每百字频率", "preferred": ["常用emoji"], "style": "描述"}
     },
+    "emotion_decoder": [
+      {"cue": "反话/试探/省略的表达", "meaning": "真实意图", "when": "场景",
+       "evidence": "原文或空", "evidence_level": "分级"}
+    ],
     "emotion": {
       "triggers": [{"when": "场景条件", "behavior": "行为", "evidence": "原文或空", "evidence_level": "分级"}],
       "expression_style": "描述",
@@ -104,4 +110,6 @@
 5. **默认完整**：用户自己的数据，完整引用是质量要求；节点宁缺毋滥，但收了的必须带原文。
 6. 不确定写"不确定"。
 7. 实体簇按「同义归一、指代归并」合并各段产物；同一实体出现在不同世界时保留两个簇（标注各自世界）。
-8. 输出 JSON 必须合法（这是最终产物的唯一输入）。
+8. **情感解码规则（v2）**：各段 emotion_decoder 合并去重——同一 cue 同一 meaning 合并为一条；cue 相同但 meaning 冲突 → 写入 conflicts（不掩盖）。
+9. **经典语录（v2）**：classic_quotes 跨段合并（同句合并计数）；口癖与经典语录保持两类，不混入。
+10. 输出 JSON 必须合法（这是最终产物的唯一输入）。

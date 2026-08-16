@@ -49,17 +49,28 @@ except Exception:
 # ---------- 常量 ----------
 PLATFORM_UNKNOWN = "unknown"
 MSG_TYPES = ("text", "emoji", "image", "system", "voice", "video", "file")
+KIND_TEXT = "text"
+KIND_PLACEHOLDER = "placeholder"
+KIND_EMOJI = "emoji"
+
+EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u2764\u2763"
+    "\U0001F1E6-\U0001F1FF\u2702-\u27B0]"
+)
 
 TS_LINE_RE = re.compile(
     r"^\s*[\[(]?"
-    r"(\d{4})[年/\-.](\d{1,2})[月/\-.](\d{1,2})[日]?\s+"
+    r"(\d{4})[年/\-.](\d{1,2})[月/\-.](\d{1,2})[日]?[T\s]+"
     r"(\d{1,2}):(\d{2})(?::(\d{2}))?"
-    r"[)\]]?\s*"
+    r"([Zz]|[+-]\d{1,2}:?\d{2})?"
+    r"\s*[)\]]?\s*"
     r"([^:：]{1,24})[:：]\s?(.*)$"
 )
 TS_LINE_NO_SENDER_RE = re.compile(
-    r"^\s*[\[(]?(\d{4})[年/\-.](\d{1,2})[月/\-.](\d{1,2})[日]?\s+"
-    r"(\d{1,2}):(\d{2})(?::(\d{2}))?[)\]]?\s*(.*)$"
+    r"^\s*[\[(]?(\d{4})[年/\-.](\d{1,2})[月/\-.](\d{1,2})[日]?[T\s]+"
+    r"(\d{1,2}):(\d{2})(?::(\d{2}))?"
+    r"([Zz]|[+-]\d{1,2}:?\d{2})?"
+    r"\s*[)\]]?\s*(.*)$"
 )
 NAME_LINE_RE = re.compile(r"^([^:：\s]{1,24})[:：]\s?(.*)$")
 
@@ -80,10 +91,31 @@ MEDIA_TYPE_MAP = {
 
 
 # ---------- 消息模型 ----------
-def make_msg(ts, sender, text, mtype="text", platform=PLATFORM_UNKNOWN):
-    """ts: ISO 字符串或 None（时间未知）。"""
+def make_msg(ts, sender, text, mtype="text", platform=PLATFORM_UNKNOWN,
+             kind=None):
+    """ts: ISO 字符串或 None（时间未知）；kind: text/placeholder/emoji（P0-4）。"""
     return {"ts": ts, "sender": sender, "text": text, "type": mtype,
-            "platform": platform}
+            "platform": platform, "kind": kind or detect_kind(text)}
+
+
+def detect_kind(text):
+    """消息类别（P0-4）：占位符消息（[图片]/[表情]/[语音]…）不计入文本统计；
+    纯 emoji/kaomoji 消息单列。"""
+    t = (text or "").strip()
+    if not t:
+        return KIND_TEXT
+    if re.fullmatch(r"\[(图片|照片|表情|动画表情|语音|视频|文件|红包|转账|"
+                    r"位置|名片|链接|音乐)\]", t):
+        return KIND_PLACEHOLDER
+    rest = EMOJI_RE.sub("", t)
+    rest = re.sub(r"[\s（()）_\-:/|\\。，！？~…、]", "", rest)
+    if rest == "":
+        return KIND_EMOJI
+    # kaomoji（纯符号串，无 CJK 无字母数字）也算 emoji
+    if not re.search(r"[\u4e00-\u9fff]", rest) and \
+            not re.search(r"[a-zA-Z0-9]", rest):
+        return KIND_EMOJI
+    return KIND_TEXT
 
 
 def detect_type(text):
@@ -101,7 +133,27 @@ def detect_type(text):
 
 
 # ---------- 时间解析 ----------
-def fmt_ts(y, mo, d, h, mi, s=0):
+def fmt_ts(y, mo, d, h, mi, s=0, tz=None):
+    """输出 ISO 时间；tz 存在时（Z 或 ±HH:MM）转换为 UTC（P1-7）。"""
+    if tz:
+        try:
+            import datetime
+            base = datetime.datetime(int(y), int(mo), int(d), int(h),
+                                     int(mi), int(s or 0))
+            if tz in ("Z", "z"):
+                base = base.replace(tzinfo=datetime.timezone.utc)
+            else:
+                m = re.match(r"([+-])(\d{1,2}):?(\d{2})", tz)
+                if m:
+                    off = datetime.timedelta(hours=int(m.group(2)),
+                                             minutes=int(m.group(3)))
+                    if m.group(1) == "-":
+                        off = -off
+                    base = base.replace(tzinfo=datetime.timezone(off))
+            return base.astimezone(datetime.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%S")
+        except (ValueError, TypeError, AttributeError):
+            pass
     try:
         return "%04d-%02d-%02dT%02d:%02d:%02d" % (int(y), int(mo), int(d),
                                                    int(h), int(mi), int(s or 0))
@@ -110,18 +162,21 @@ def fmt_ts(y, mo, d, h, mi, s=0):
 
 
 def parse_iso(ts_str):
-    """宽松 ISO 时间解析，失败返回 None。"""
+    """宽松 ISO 时间解析（支持 Z / ±HH:MM 时区，P1-7），失败返回 None。"""
     s = (ts_str or "").strip()
-    m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?",
-                 s)
+    m = re.match(
+        r"^(\d{4})-(\d{1,2})-(\d{1,2})[T\s](\d{1,2}):(\d{2})(?::(\d{2}))?"
+        r"(?:\.\d+)?([Zz]|[+-]\d{1,2}:?\d{2})?", s)
     if m:
-        return fmt_ts(*m.groups())
+        y, mo, d, h, mi, sec, tz = m.groups()
+        return fmt_ts(y, mo, d, h, mi, sec, tz)
     return None
 
 
 # ---------- 编码探测 ----------
 def read_text(path):
-    """UTF-8 优先，兼容 GBK（Windows 导出常见）；降级 latin-1 不丢字节。"""
+    """UTF-8 优先，兼容 GBK（Windows 导出常见）；降级 latin-1 不丢字节。
+    （仅 JSON/HTML/照片等必须整读的格式使用；TXT 走流式 open_text_stream）"""
     with open(path, "rb") as f:
         raw = f.read()
     if raw.startswith(b"\xef\xbb\xbf"):
@@ -135,56 +190,93 @@ def read_text(path):
     return raw.decode("latin-1", errors="replace")
 
 
+def detect_encoding(head):
+    """按文件头字节探测编码（P1-6 流式配套）。"""
+    if head.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    for enc in ("utf-8", "gbk", "gb18030", "utf-16"):
+        try:
+            head.decode(enc)
+            return enc
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return "latin-1"
+
+
+def open_text_stream(path):
+    """按行流式打开文本文件（编码自动探测）。返回文本文件对象（with 使用）。"""
+    with open(path, "rb") as f:
+        head = f.read(8192)
+    return open(path, "r", encoding=detect_encoding(head),
+                errors="replace", newline="")
+
+
 # ---------- TXT 行格式解析（微信/QQ/短信/iMessage/抖音共用） ----------
-def parse_txt_lines(text, platform=PLATFORM_UNKNOWN):
+def _parse_txt_lines(lines, platform=PLATFORM_UNKNOWN):
     """
     核心规则（§8 工程坑 3）：一条消息可能跨多行；以"时间戳开头"为新消息的判定标准。
-    行格式：[YYYY-MM-DD HH:MM] 发送者: 内容（括号可选，/年 分隔符兼容）。
+    行格式：[YYYY-MM-DD HH:MM] 发送者: 内容（括号可选，/年 分隔符兼容，支持时区）。
+    流式（P1-6）：lines 为迭代器；续行用列表暂存，join 合并（消除 O(n²) 拼接）。
     """
     msgs = []
-    cur = None
-    for raw_line in text.splitlines():
+    cur = None  # dict，文本暂存于 _parts 列表
+
+    def flush():
+        nonlocal cur
+        if cur is not None:
+            cur["text"] = "\n".join(cur.pop("_parts"))
+            msgs.append(cur)
+            cur = None
+
+    for raw_line in lines:
         line = raw_line.rstrip("\r")
         if not line.strip():
             continue
         m = TS_LINE_RE.match(line)
         if m:
-            y, mo, d, h, mi, s, sender, content = m.groups()
-            ts = fmt_ts(y, mo, d, h, mi, s)
-            if cur is not None:
-                msgs.append(cur)
-            cur = make_msg(ts, sender.strip(), content, detect_type(content),
-                           platform)
+            flush()
+            y, mo, d, h, mi, s, tz, sender, content = m.groups()
+            ts = fmt_ts(y, mo, d, h, mi, s, tz)
+            cur = make_msg(ts, sender.strip(), content,
+                           detect_type(content), platform)
+            cur["_parts"] = [content]
             continue
         m2 = TS_LINE_NO_SENDER_RE.match(line)
         if m2:
-            y, mo, d, h, mi, s, content = m2.groups()
-            ts = fmt_ts(y, mo, d, h, mi, s)
-            if cur is not None:
-                msgs.append(cur)
+            flush()
+            y, mo, d, h, mi, s, tz, content = m2.groups()
+            ts = fmt_ts(y, mo, d, h, mi, s, tz)
             cur = make_msg(ts, None, content, detect_type(content), platform)
+            cur["_parts"] = [content]
             continue
         # 无时间戳：若是"名字: 内容"且当前消息为空，则作为新消息（尽力推测）
         m3 = NAME_LINE_RE.match(line)
         if cur is not None and cur["ts"] is None and m3:
-            msgs.append(cur)
+            flush()
             cur = make_msg(None, m3.group(1).strip(), m3.group(2),
                            detect_type(m3.group(2)), platform)
+            cur["_parts"] = [m3.group(2)]
             continue
         # 续行：接到当前消息尾部（保留原文不丢）
         if cur is not None:
-            cur["text"] = cur["text"] + "\n" + line
+            cur["_parts"].append(line)
         else:
             # 文件开头无时间戳：作为"时间未知"消息（尽力推测发送者）
             m4 = NAME_LINE_RE.match(line)
             if m4:
                 cur = make_msg(None, m4.group(1).strip(), m4.group(2),
                                detect_type(m4.group(2)), platform)
+                cur["_parts"] = [m4.group(2)]
             else:
                 cur = make_msg(None, None, line, detect_type(line), platform)
-    if cur is not None:
-        msgs.append(cur)
+                cur["_parts"] = [line]
+    flush()
     return msgs
+
+
+def parse_txt_lines(text, platform=PLATFORM_UNKNOWN):
+    """兼容入口：整段文本 → 消息流（内部走流式实现）。"""
+    return _parse_txt_lines(text.splitlines(), platform)
 
 
 # ---------- HTML 解析（微信导出 html 等） ----------
@@ -640,7 +732,8 @@ def _effective_platform(fmt, hint):
     return hint or PLATFORM_UNKNOWN
 
 
-def parse_files(inputs, platform=None, forced_map=None, out_dir="."):
+def parse_files(inputs, platform=None, forced_map=None, out_dir=".",
+                dedup=True):
     all_msgs = []
     warnings = []
     formats = []
@@ -657,33 +750,40 @@ def parse_files(inputs, platform=None, forced_map=None, out_dir="."):
             all_msgs.extend(msgs)
         else:
             try:
-                text = read_text(inp)
+                # 格式嗅探只读文件头（P1-6：大导出不整读）
+                with open(inp, "rb") as f:
+                    head_bytes = f.read(8192)
             except OSError as e:
                 sys.stderr.write("无法读取文件 %s: %s\n" % (inp, e))
                 return 1
-            fmt = sniff_format(inp, text, False)
+            head_text = head_bytes.decode(detect_encoding(head_bytes),
+                                          errors="replace")[:2000]
+            fmt = sniff_format(inp, head_text, False)
             formats.append(fmt)
             pfx = _effective_platform(fmt, platform)
             if fmt == "txt_timeline":
-                msgs = parse_txt_lines(text, pfx)
+                with open_text_stream(inp) as f:
+                    msgs = _parse_txt_lines(f, pfx)
             elif fmt == "html":
-                msgs = parse_html(text, pfx)
+                msgs = parse_html(read_text(inp), pfx)
             elif fmt == "telegram_json":
                 import json as _json
                 try:
-                    msgs = parse_telegram_json(_json.loads(text), pfx)
+                    msgs = parse_telegram_json(_json.loads(read_text(inp)), pfx)
                 except ValueError:
                     msgs = []
             elif fmt == "twitter_js":
-                msgs = parse_twitter_js(text)
+                msgs = parse_twitter_js(read_text(inp))
             elif fmt == "sms_csv":
-                msgs = parse_sms_csv(text, pfx)
+                msgs = parse_sms_csv(read_text(inp), pfx)
             elif fmt == "generic_json":
-                msgs = parse_generic_json(text, pfx)
+                msgs = parse_generic_json(read_text(inp), pfx)
             else:  # plain_txt
-                msgs = parse_txt_lines(text, pfx)
+                with open_text_stream(inp) as f:
+                    msgs = _parse_txt_lines(f, pfx)
                 if len([m for m in msgs if m["ts"]]) < 2:
-                    msgs = parse_plain_fallback(text, pfx)
+                    with open_text_stream(inp) as f:
+                        msgs = _parse_plain_fallback(f, pfx)
             if not msgs:
                 warnings.append("%s: 格式(%s)未解析出消息——该文件格式异常，请提供 txt 导出"
                                 % (inp, fmt))
@@ -707,17 +807,27 @@ def parse_files(inputs, platform=None, forced_map=None, out_dir="."):
     keyed.sort(key=lambda x: (x[0] == "", x[0], x[1]))
     all_msgs = [k[2] for k in keyed]
 
+    # 同平台重复导出去重（P0-3，默认开；跨平台差异保留）
+    if dedup:
+        all_msgs, removed = dedup_messages(all_msgs)
+        if removed:
+            warnings.append("同平台重复消息去重 %d 条（跨平台差异保留——"
+                            "不同平台的表达差异是多面性素材）" % removed)
+
     messages_path = os.path.join(out_dir, "messages.json")
     with open(messages_path, "w", encoding="utf-8") as f:
         json.dump(all_msgs, f, ensure_ascii=False, indent=2)
 
+    from collections import Counter as _Counter
     meta = {
         "format": formats,
         "platform": platform or PLATFORM_UNKNOWN,
         "sender_map": mapping,
         "count": len(all_msgs),
+        "dedup": dedup,
+        "per_kind": dict(_Counter(m.get("kind") for m in all_msgs)),
         "warnings": warnings,
-        "pipeline": "parse.py",
+        "pipeline": "parse.py v2",
     }
     meta_path = os.path.join(out_dir, "parse_meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -727,36 +837,68 @@ def parse_files(inputs, platform=None, forced_map=None, out_dir="."):
     print("解析完成：共 %d 条消息（%d 条含时间戳），发送者 %d 人"
           % (len(all_msgs), n_ts, len(mapping)))
     print("发送者映射: %s" % json.dumps(mapping, ensure_ascii=False))
+    print("消息类别: %s" % json.dumps(meta["per_kind"], ensure_ascii=False))
     print("输出: %s" % messages_path)
     for w in warnings:
         print("  - %s" % w)
     return 0
 
 
+def dedup_messages(msgs):
+    """同平台重复导出去重（P0-3）：按 (platform, ts, sender, text) 哈希。
+    跨平台不去重——同一内容在不同平台的表达差异是她的多面性素材。"""
+    seen = set()
+    out = []
+    removed = 0
+    for m in msgs:
+        key = (m.get("platform"), m.get("ts"), m.get("sender"),
+               m.get("text"))
+        if key in seen:
+            removed += 1
+            continue
+        seen.add(key)
+        out.append(m)
+    return out, removed
+
+
 def parse_plain_fallback(text, platform):
-    """纯文本（无时间戳）：按「名字: 内容」行切分；无法切分的整段保留为一条。"""
+    """兼容入口：纯文本（无时间戳）→ 消息流。"""
+    return _parse_plain_fallback(text.splitlines(), platform)
+
+
+def _parse_plain_fallback(lines, platform):
+    """纯文本（无时间戳）：按「名字: 内容」行切分；无法切分的整段保留为一条。
+    流式实现（P1-6）。"""
     msgs = []
-    cur = None
-    for raw_line in text.splitlines():
+    cur = None  # dict，文本暂存 _parts
+
+    def flush():
+        nonlocal cur
+        if cur is not None:
+            cur["text"] = "\n".join(cur.pop("_parts"))
+            msgs.append(cur)
+            cur = None
+
+    for raw_line in lines:
         line = raw_line.rstrip("\r")
         if not line.strip():
             continue
         m = NAME_LINE_RE.match(line)
         if m:
-            if cur is not None:
-                msgs.append(cur)
+            flush()
             cur = make_msg(None, m.group(1).strip(), m.group(2),
                            detect_type(m.group(2)), platform)
+            cur["_parts"] = [m.group(2)]
         else:
             if cur is not None:
-                cur["text"] = cur["text"] + "\n" + line
+                cur["_parts"].append(line)
             else:
                 cur = make_msg(None, None, line, detect_type(line), platform)
-    if cur is not None:
-        msgs.append(cur)
+                cur["_parts"] = [line]
+    flush()
     if len(msgs) == 1 and msgs[0]["sender"] is None:
         # 完全无法切分：保留原文不丢，标记时间未知
-        msgs[0]["text"] = text.strip()
+        msgs[0]["text"] = "\n".join(msgs[0]["text"].split("\n"))
     return msgs
 
 
@@ -768,6 +910,11 @@ def main(argv=None):
                     help="强制平台标签（wechat/douyin/qq/telegram/sms/...；默认自动）")
     ap.add_argument("--map", default=None,
                     help='锚点发送者映射，如 \'{"小美":"B","我":"A"}\'（§8 多段校准）')
+    ap.add_argument("--dedup", dest="dedup", action="store_true", default=True,
+                    help="同平台重复导出去重（按 platform+ts+sender+text，默认开；"
+                         "跨平台差异保留）")
+    ap.add_argument("--no-dedup", dest="dedup", action="store_false",
+                    help="关闭去重（多平台混用时保留全部）")
     args = ap.parse_args(argv)
     forced_map = None
     if args.map:
@@ -777,7 +924,8 @@ def main(argv=None):
             sys.stderr.write("--map 不是合法 JSON\n")
             return 1
     os.makedirs(args.out, exist_ok=True)
-    return parse_files(args.inputs, args.platform, forced_map, args.out)
+    return parse_files(args.inputs, args.platform, forced_map, args.out,
+                       dedup=args.dedup)
 
 
 if __name__ == "__main__":

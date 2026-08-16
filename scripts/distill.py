@@ -27,10 +27,12 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DEFAULT_API_BASE = "https://api.deepseek.com/v1"
 DEFAULT_MODEL = "deepseek-chat"
@@ -103,17 +105,46 @@ def call_json(base, key, model, messages, temperature=0.3):
         return parse_json_response(content)
 
 
+RETRYABLE_HTTP = (429, 500, 502, 503, 504)
+
+
+def _retry_delay(attempt, exc):
+    """退避：429 优先读 Retry-After（上限 60s）；其余指数退避。"""
+    if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
+        ra = exc.headers.get("Retry-After") if exc.headers else None
+        if ra:
+            try:
+                return min(60, max(1, int(ra)))
+            except ValueError:
+                pass
+        return 30  # 429 无 Retry-After：较长退避
+    return 2 ** (attempt - 1)
+
+
+def is_retryable(e):
+    """v2（P1-5）：只重试 5xx/429/网络错误/响应解析失败；4xx 不重试。"""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in RETRYABLE_HTTP
+    if isinstance(e, (urllib.error.URLError, TimeoutError, ConnectionError,
+                      OSError, ValueError)):
+        return True
+    return False
+
+
 def with_retry(fn, *args, **kwargs):
-    """重试上限 3 次（§4.1 熔断：不无限重试），退避 1/2/4 秒。"""
+    """重试上限 3 次（§4.1 熔断：不无限重试）；4xx 直接抛不重试（P1-5）。"""
     last = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
             last = e
-            sys.stderr.write("  [retry %d/3] %s: %s\n" % (attempt, type(e).__name__, e))
+            if not is_retryable(e):
+                raise  # 4xx（除 429）等不可重试：直接抛
+            sys.stderr.write("  [retry %d/%d] %s: %s\n"
+                             % (attempt, MAX_RETRIES, type(e).__name__, e))
             if attempt < MAX_RETRIES:
-                time.sleep(2 ** (attempt - 1))
+                time.sleep(_retry_delay(attempt, e))
     raise RuntimeError("API 调用失败（已重试 %d 次）: %s" % (MAX_RETRIES, last))
 
 
@@ -435,6 +466,68 @@ def _offline_first_mes(segments):
             top(by_hour["久别后"])]
 
 
+# ---------- 单段蒸馏（并行安全） ----------
+_CP_LOCK = threading.Lock()
+
+
+def _distill_segment(seg, args, cp, base, key, model, persona_tpl,
+                     memories_tpl, stats, total):
+    """蒸馏单段；返回 (sid, status, out_file)。checkpoint 操作带锁（并行安全）。"""
+    sid = seg["id"]
+    with _CP_LOCK:
+        st = seg_status(cp, sid)
+        if st and st["status"] == "done" and st.get("out") and \
+                os.path.isfile(os.path.join(args.out, st["out"])):
+            return sid, "done", st["out"]
+        mark(cp, sid, "running")
+        save_checkpoint(args.out, cp)
+
+    print("[%d/%d] 蒸馏段 %d（%d 条消息，%s → %s）..."
+          % (sid + 1, total, sid, seg["count"], seg.get("start"),
+             seg.get("end")))
+    seg_text = format_segment_text(seg["messages"])
+    if len(seg_text) > 60000:
+        sys.stderr.write("  ⚠ 该段文本约 %d 字符，可能超出模型上下文一半；"
+                         "建议用 segment.py --max-messages 重新切段\n" % len(seg_text))
+
+    out_file = "seg_%d.json" % sid
+    try:
+        if args.offline:
+            sub = offline_distill([seg], stats, args.name)
+            result = {"segment_id": sid, "persona": sub["persona"],
+                      "memories": sub["memories"],
+                      "entity_clusters": sub["entity_clusters"]}
+        else:
+            result = {}
+            user_stats = stats_summary(stats)
+            for key_tpl, tpl in (("persona", persona_tpl),
+                                 ("memories", memories_tpl)):
+                prompt = fill(tpl, SEGMENT_TEXT=seg_text, STATS=user_stats,
+                              SEGMENT_ID=sid, TOTAL_SEGMENTS=total,
+                              HER_NAME=args.name or "她")
+                out = with_retry(call_json, base, key, model,
+                                 [{"role": "user", "content": prompt}])
+                result[key_tpl] = out
+            if "persona" not in result or "memories" not in result:
+                raise RuntimeError("段产物缺少 persona/memories 字段")
+            result["entity_clusters"] = result.get("memories", {}).get(
+                "entity_clusters", [])
+    except Exception as e:
+        sys.stderr.write("  段 %d 蒸馏失败：%s\n" % (sid, e))
+        with _CP_LOCK:
+            mark(cp, sid, "failed", retries=MAX_RETRIES)
+            save_checkpoint(args.out, cp)
+        return sid, "failed", None
+
+    with open(os.path.join(args.out, out_file), "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    with _CP_LOCK:
+        mark(cp, sid, "done", retries=0, out=out_file)
+        save_checkpoint(args.out, cp)
+    print("  ✓ 段 %d 完成 → %s" % (sid, out_file))
+    return sid, "ok", out_file
+
+
 # ---------- 主流程 ----------
 def main(argv=None):
     ap = argparse.ArgumentParser(description="溯洄 · LLM 逐段蒸馏 + 合并（§4.1）")
@@ -446,6 +539,9 @@ def main(argv=None):
     ap.add_argument("--offline", action="store_true",
                     help="离线启发式骨架模式（无 key 验证管线用，低质量）")
     ap.add_argument("--no-merge", action="store_true", help="只逐段蒸馏，不合并")
+    ap.add_argument("--parallel", type=int, default=1,
+                    help="并发蒸馏段数（P2-10；默认 1 串行；注意 API 限流，"
+                         "429 由重试退避保护）")
     args = ap.parse_args(argv)
 
     with open(args.segments, "r", encoding="utf-8") as f:
@@ -478,60 +574,46 @@ def main(argv=None):
     total = len(segments)
     done_seg_files = []
 
+    # 预扫描：跳过已完成段
     for seg in segments:
-        sid = seg["id"]
-        st = seg_status(cp, sid)
+        st = seg_status(cp, seg["id"])
         if st and st["status"] == "done" and st.get("out") and \
                 os.path.isfile(os.path.join(args.out, st["out"])):
             done_seg_files.append(st["out"])
-            print("[%d/%d] 段 %d 已完成（断点续传跳过）" % (sid + 1, total, sid))
-            continue
-        if st and st["status"] == "running":
-            pass  # 上次中断在 running：重新跑
-        mark(cp, sid, "running")
-        save_checkpoint(args.out, cp)
+            print("[%d/%d] 段 %d 已完成（断点续传跳过）" % (seg["id"] + 1, total,
+                                                   seg["id"]))
+    todo = [seg for seg in segments
+            if not (seg_status(cp, seg["id"]) and
+                    seg_status(cp, seg["id"])["status"] == "done")]
 
-        print("[%d/%d] 蒸馏段 %d（%d 条消息，%s → %s）..."
-              % (sid + 1, total, sid, seg["count"], seg.get("start"), seg.get("end")))
-        seg_text = format_segment_text(seg["messages"])
-        if len(seg_text) > 60000:
-            sys.stderr.write("  ⚠ 该段文本约 %d 字符，可能超出模型上下文一半；"
-                             "建议用 segment.py --max-messages 重新切段\n" % len(seg_text))
-
-        out_file = "seg_%d.json" % sid
-        if args.offline:
-            sub = offline_distill([seg], stats, args.name)
-            result = {"segment_id": sid, "persona": sub["persona"],
-                      "memories": sub["memories"],
-                      "entity_clusters": sub["entity_clusters"]}
-        else:
-            result = {}
-            user_stats = stats_summary(stats)
-            for key_tpl, tpl in (("persona", persona_tpl), ("memories", memories_tpl)):
-                prompt = fill(tpl, SEGMENT_TEXT=seg_text, STATS=user_stats,
-                              SEGMENT_ID=sid, TOTAL_SEGMENTS=total,
-                              HER_NAME=args.name or "她")
+    if todo and args.parallel > 1 and not args.offline:
+        # v2（P2-10）：并发蒸馏（--parallel N，注意限流——429 由重试退避处理）
+        print("并发蒸馏：%d 段 / %d 并发（限流由重试退避保护）..."
+              % (len(todo), args.parallel))
+        with ThreadPoolExecutor(max_workers=args.parallel) as ex:
+            futs = {ex.submit(_distill_segment, seg, args, cp, base, key,
+                              model, persona_tpl, memories_tpl, stats,
+                              total): seg for seg in todo}
+            for fut in as_completed(futs):
+                seg = futs[fut]
                 try:
-                    out = with_retry(call_json, base, key, model,
-                                     [{"role": "user", "content": prompt}])
+                    sid, status, out_file = fut.result()
                 except Exception as e:
-                    sys.stderr.write("  段 %d 蒸馏失败：%s\n" % (sid, e))
-                    mark(cp, sid, "failed", retries=MAX_RETRIES)
-                    save_checkpoint(args.out, cp)
-                    break
-                result[key_tpl] = out
-            if "persona" not in result or "memories" not in result:
-                continue
-            # 段内合并实体簇（从 memories 提取标签）
-            result["entity_clusters"] = result.get("memories", {}).get(
-                "entity_clusters", [])
-
-        with open(os.path.join(args.out, out_file), "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        mark(cp, sid, "done", retries=0, out=out_file)
-        save_checkpoint(args.out, cp)
-        done_seg_files.append(out_file)
-        print("  ✓ 段 %d 完成 → %s" % (sid, out_file))
+                    print("  ✗ 段 %d 异常：%s" % (seg["id"], e))
+                    continue
+                if status == "ok":
+                    done_seg_files.append(out_file)
+                elif status == "done":
+                    done_seg_files.append(out_file)
+                    print("[%d/%d] 段 %d 已完成（断点续传跳过）"
+                          % (seg["id"] + 1, total, seg["id"]))
+    else:
+        for seg in todo:
+            sid, status, out_file = _distill_segment(
+                seg, args, cp, base, key, model, persona_tpl, memories_tpl,
+                stats, total)
+            if status in ("ok", "done"):
+                done_seg_files.append(out_file)
 
     # 检查是否有 failed 段
     failed = [s for s in cp["segments"] if s["status"] == "failed"]
@@ -567,6 +649,7 @@ def main(argv=None):
             "coverage": "full" if len(segments) == 1 else "segmented",
             "stats": stats,
             "segment_count": len(done_seg_files),
+            "corpus": [m for seg in segments for m in seg["messages"]],
         })
     else:
         merge_tpl = load_prompt(prompts_dir, "merge.md")
@@ -595,6 +678,7 @@ def main(argv=None):
             "coverage": "full" if len(segments) == 1 else "segmented",
             "stats": stats,
             "segment_count": len(done_seg_files),
+            "corpus": [m for seg in segments for m in seg["messages"]],
         })
 
     with open(merged_path, "w", encoding="utf-8") as f:

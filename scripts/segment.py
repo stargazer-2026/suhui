@@ -105,7 +105,8 @@ def sample_even(msgs, k):
 
 # ---------- 统计 ----------
 def _tokens(text):
-    """口癖候选：2-4 字词（中文滑窗）+ 英文词。"""
+    """口癖候选（v2 收窄，新14）：仅 2 字 bigram + 英文词。
+    完整句不再进口癖候选（低频整句归「经典语录」top_quotes）。"""
     out = []
     t = re.sub(r"\s+", "", text or "")
     for m in re.finditer(r"[a-zA-Z0-9]+", t):
@@ -120,17 +121,27 @@ def _tokens(text):
                 w = seg[i:i + 2]
                 if w not in STOPWORDS:
                     out.append(w)
-            out.append(seg)
     return out
 
 
 def top_phrases(texts, topn=20, min_count=2):
+    """口癖=高频短词/短语：min_count 过滤（频率 1 的整句不进口癖表）。"""
     cnt = Counter()
     for t in texts:
         for w in _tokens(t):
             cnt[w] += 1
     return [{"phrase": w, "count": c} for w, c in cnt.most_common(topn)
             if c >= min_count]
+
+
+def top_quotes(texts, topn=10, min_len=4, max_len=30):
+    """经典语录（新14）：低频但完整的句子（4-30 字），与口癖分开归类。"""
+    cnt = Counter()
+    for t in texts:
+        s = re.sub(r"\s+", "", t or "")
+        if min_len <= len(s) <= max_len:
+            cnt[s] += 1
+    return [{"quote": q, "count": c} for q, c in cnt.most_common(topn)]
 
 
 def compute_stats(msgs):
@@ -154,20 +165,30 @@ def compute_stats(msgs):
         weekday[dt.strftime("%a")] += 1
 
     # 句长（按消息内句子/消息本身字符数）
+    # v2（P0-4）：kind=placeholder 的消息（[图片]/[表情]…）不计入文本统计；
+    # 另给 trimmed 中位数（排除 ≤1 字消息，避免超短消息拉低句长中位数）
     lengths = []
     emoji_cnt = Counter()
     punct_cnt = Counter()
     sender_texts = {"A": [], "B": []}
     sender_lens = {"A": [], "B": []}
+    sender_lens_main = {"A": [], "B": []}   # 排除 ≤1 字
+    per_kind = Counter()
     for m in msgs:
+        kind = m.get("kind") or "text"
+        per_kind[kind] += 1
         text = m.get("text") or ""
         L = len(re.sub(r"\s+", "", text))
+        if kind == "placeholder":
+            continue  # 占位符不参与文本统计（P0-4）
         if L > 0:
             lengths.append(L)
         s = m.get("sender")
         if s in ("A", "B"):
             sender_texts[s].append(text)
             sender_lens[s].append(L)
+            if L > 1:
+                sender_lens_main[s].append(L)
         for ch in text:
             if EMOJI_RE.match(ch):
                 emoji_cnt[ch] += 1
@@ -212,6 +233,7 @@ def compute_stats(msgs):
         "per_sender": dict(per_sender),
         "per_platform": dict(per_platform),
         "per_type": dict(per_type),
+        "per_kind": dict(per_kind),
         "span": span,
         "hourly_activity": dict(sorted(hourly.items())),
         "weekday_activity": dict(weekday),
@@ -223,8 +245,11 @@ def compute_stats(msgs):
         "top_phrases": top_phrases([t for t in sender_texts["A"] + sender_texts["B"]]),
         "top_phrases_A": top_phrases(sender_texts["A"]),
         "top_phrases_B": top_phrases(sender_texts["B"]),
+        "top_quotes": top_quotes([t for t in sender_texts["A"] + sender_texts["B"]]),
+        "top_quotes_B": top_quotes(sender_texts["B"]),
         "sender_len_B": _percentiles(sender_lens["B"]),
         "sender_len_A": _percentiles(sender_lens["A"]),
+        "sender_len_B_main": _percentiles(sender_lens_main["B"]),
         "reply_delay_seconds": _percentiles(delays) if delays else None,
         "conversation_initiators": dict(initiator),
         "night_ratio_B": _night_ratio(msgs, "B"),
@@ -290,7 +315,14 @@ def main(argv=None):
                     help="按对话间隙切段：间隔 > N 分钟切新段")
     ap.add_argument("--max-messages", type=int, default=None,
                     help="按消息数硬切（token 预算：每段 ≤ 模型上下文的一半）")
-    ap.add_argument("--days", action="store_true", help="按自然日切段")
+    ap.add_argument("--days", action="store_true",
+                    help="按活跃间隔切段（默认 12 小时；v2 语义：23:00-01:00 的"
+                         "跨午夜连续对话不切断，避免损失深夜场景样本）")
+    ap.add_argument("--active-gap", action="store_true",
+                    help="同 --days（按活跃间隔切段）")
+    ap.add_argument("--active-gap-minutes", type=int, default=360,
+                    help="活跃间隔分钟数（默认 360=6h；连续对话中断超过该间隔才切新段，"
+                         "跨午夜连续对话不切断）")
     ap.add_argument("-k", type=int, default=0, help="可选采样加速（均匀抽样 N 条，非默认）")
     args = ap.parse_args(argv)
 
@@ -299,16 +331,22 @@ def main(argv=None):
         sys.stderr.write("messages.json 为空\n")
         return 1
 
-    if args.days:
-        mode = "day"
+    if args.days or args.active_gap:
+        # v2（P1-8）：按活跃间隔切段——跨午夜连续对话（23:00-01:00）不切断，
+        # 深夜场景样本保留（场景化 when→behavior 规则依赖深夜样本）
+        mode = "gap"
+        gap_min = args.active_gap_minutes
     elif args.gap_minutes:
         mode = "gap"
+        gap_min = args.gap_minutes
     elif args.max_messages:
         mode = "count"
+        gap_min = 720
     else:
         mode = "full"
+        gap_min = 720
 
-    segs, eff_mode = build_segments(msgs, mode, args.gap_minutes or 720,
+    segs, eff_mode = build_segments(msgs, mode, gap_min,
                                     args.max_messages or 2000, args.k)
     stats = compute_stats(msgs)
 
