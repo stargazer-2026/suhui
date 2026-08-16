@@ -38,6 +38,13 @@
 2. **说"开始蒸馏"**——skill 会引导你走完分步流程：导入菜单 → 基础信息 → 蒸馏 → 产物预览 → 像度验收 → 开始对话
 3. **全程无需任何 API 密钥**：蒸馏在会话内完成（分批读文件 → 按模板逐批蒸馏 → 合并，显示进度，可中断续传）
 
+### DeepSeek Harness（DSH）支持
+
+兼容 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)：
+
+- 方式一：克隆/解压到 `~/.dsh/skills/suhui/`（dsh 的 skill-filesystem 直接解析 SKILL.md frontmatter）
+- 方式二：`dsh plugin add github:stargazer-2026/suhui`
+
 ### 脚本路径（可选，需 API 密钥）
 
 ```bash
