@@ -49,7 +49,7 @@ def make_slug(name):
     ascii_part = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower()
     if ascii_part:
         return ascii_part
-    # 无拼音库 + 纯中文：确定性回退（记录在 README 的决定清单）
+    # 无拼音库 + 纯中文：确定性回退
     return "cn-" + hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
 
 
