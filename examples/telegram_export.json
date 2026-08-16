@@ -1,0 +1,19 @@
+{
+  "name": "synthetic-chat",
+  "type": "personal_chat",
+  "id": 0,
+  "messages": [
+    {"id": 1, "type": "message", "date": "2030-04-10T20:11:23", "from": "__NAME__", "from_id": "user10001", "text": "晚上好呀"},
+    {"id": 2, "type": "message", "date": "2030-04-10T20:12:01", "from": "我", "from_id": "user10002", "text": "晚上好"},
+    {"id": 3, "type": "message", "date": "2030-04-10T20:13:40", "from": "__NAME__", "from_id": "user10001", "text": "今天在__PLACE__看到一只超肥的猫"},
+    {"id": 4, "type": "message", "date": "2030-04-10T20:14:02", "from": "__NAME__", "from_id": "user10001", "text": "蹲在路边晒太阳 一动不动"},
+    {"id": 5, "type": "message", "date": "2030-04-10T20:15:30", "from": "我", "from_id": "user10002", "text": "哈哈哈 你拍了没"},
+    {"id": 6, "type": "photo", "date": "2030-04-10T20:16:11", "from": "__NAME__", "from_id": "user10001", "text": "", "photo": "photo_1.jpg"},
+    {"id": 7, "type": "message", "date": "2030-04-10T20:16:40", "from": "__NAME__", "from_id": "user10001", "text": "就这只"},
+    {"id": 8, "type": "message", "date": "2030-04-10T21:02:55", "from": "__NAME__", "from_id": "user10001", "text": "明天又要早起了 唉"},
+    {"id": 9, "type": "message", "date": "2030-04-10T21:03:20", "from": "我", "from_id": "user10002", "text": "几点起"},
+    {"id": 10, "type": "message", "date": "2030-04-10T21:04:02", "from": "__NAME__", "from_id": "user10001", "text": "六点半"},
+    {"id": 11, "type": "message", "date": "2030-04-10T21:04:15", "from": "__NAME__", "from_id": "user10001", "text": "我先睡了 晚安"},
+    {"id": 12, "type": "message", "date": "2030-04-10T21:04:30", "from": "我", "from_id": "user10002", "text": "晚安"}
+  ]
+}

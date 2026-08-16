@@ -1,0 +1,23 @@
+# ── 运行时产物（不发布） ──
+data/
+models/
+backups/
+distill_out/
+*.log
+*.tmp
+*.part
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ── 内部文档（不发布） ──
+PROGRESS.md
+README.dev.md
+docs/
+
+# ── 系统 ──
+.DS_Store
+Thumbs.db
