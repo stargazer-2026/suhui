@@ -615,17 +615,19 @@ def main(argv=None):
     with open(os.path.join(args.out, "SKILL.md"), "w", encoding="utf-8") as f:
         f.write(skill_md)
 
-    # 版本快照（P2-15：纠正回路 rollback 依赖；同类项目 v1-vN 目录）
+    # 版本快照（P2-15/P1-9）：先算快照号并更新 meta（快照内 meta 与最终一致），
+    # 再复制快照；ignore 排除 snapshots/ 与大目录（models/data 等）
     import shutil as _shutil
     snap_dir = os.path.join(args.out, "snapshots")
     existing = [d for d in os.listdir(snap_dir)
                 if re.fullmatch(r"v\d+", d)] if os.path.isdir(snap_dir) else []
     vnum = max([int(d[1:]) for d in existing], default=0) + 1
-    snap = os.path.join(snap_dir, "v%d" % vnum)
-    _shutil.copytree(args.out, snap, ignore=_shutil.ignore_patterns("snapshots"))
     meta["snapshot"] = "v%d" % vnum
     with open(os.path.join(args.out, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
+    snap = os.path.join(snap_dir, "v%d" % vnum)
+    _shutil.copytree(args.out, snap, ignore=_shutil.ignore_patterns(
+        "snapshots", "models", "data", "__pycache__"))
     print("版本快照已建: %s/snapshots/v%d（rollback <版本> 可回滚）"
           % (args.out, vnum))
 

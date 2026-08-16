@@ -133,11 +133,27 @@ def _check_memories_skeleton(m, problems, strict=False):
         if not n.get("evidence"):
             problems.append("节点「%s」缺原文证据（verbatim 铁律）" % n.get("event", "?"))
         emo = n.get("emotion")
-        if emo is not None and not (-10 <= float(emo) <= 10):
-            problems.append("节点「%s」情感值 %s 超出 -10~10" % (n.get("event"), emo))
+        if emo is not None:
+            try:
+                emo_f = float(emo)
+            except (ValueError, TypeError):
+                problems.append("节点「%s」情感值非数字: %r"
+                                % (n.get("event", "?"), emo))
+                emo_f = None
+            if emo_f is not None and not (-10 <= emo_f <= 10):
+                problems.append("节点「%s」情感值 %s 超出 -10~10"
+                                % (n.get("event", "?"), emo))
         imp = n.get("importance")
-        if imp is not None and not (0 <= float(imp) <= 1):
-            problems.append("节点「%s」重要性 %s 超出 0~1" % (n.get("event"), imp))
+        if imp is not None:
+            try:
+                imp_f = float(imp)
+            except (ValueError, TypeError):
+                problems.append("节点「%s」重要性非数字: %r"
+                                % (n.get("event", "?"), imp))
+                imp_f = None
+            if imp_f is not None and not (0 <= imp_f <= 1):
+                problems.append("节点「%s」重要性 %s 超出 0~1"
+                                % (n.get("event", "?"), imp))
     for s in m.get("timeline") or []:
         if isinstance(s, dict) and (not s.get("stage")):
             problems.append("timeline 项缺 stage")

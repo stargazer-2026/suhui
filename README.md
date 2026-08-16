@@ -51,7 +51,7 @@
 # 0. 安装（自动检查/补装运行组件，失败自动降级，用户无感）
 ./install.sh
 
-# 1. 解析：聊天记录 → 标准消息流（同一平台重复导出自动去重；跨平台差异保留）
+# 1. 解析：聊天记录 → 标准消息流（跨文件重叠去重，同文件内重复保留）
 python3 scripts/parse.py <聊天记录文件> --out <目录>
 
 # 2. 切段：按时间切段 + 统计摘要（默认全量）
@@ -60,10 +60,14 @@ python3 scripts/segment.py <目录>/messages.json --out <目录>
 # 3. 蒸馏：逐段调 LLM API + 合并（断点续传）
 export LLM_API_KEY=...          # 可选：LLM_API_BASE / LLM_MODEL
 python3 scripts/distill.py <目录>/segments.json <目录>/stats.json prompts/ \
-    --out <目录>/distill --name 她的名字
+    --out <目录>/distill --name 她的名字          # 可加 --parallel N 并发
 
-# 4. 合成产物：memories.md + persona.md + meta.json + SKILL.md
-python3 scripts/build.py <目录>/distill/merged.json --out <目录>/product --name 她的名字
+# 3b. 校验段产物（JSON 语法/字段完整性/证据分级）
+python3 scripts/validate.py <目录>/distill
+
+# 4. 合成产物：memories.md + persona.md + meta.json + SKILL.md（自动版本快照）
+python3 scripts/build.py <目录>/distill/merged.json --out <目录>/product \
+    --name 她的名字 --slug ke-du-niang     # --slug 指定可读产物目录名（拼音/英文）
 
 # 5. 加载对话：把产物目录作为 skill 加载（纯 Markdown 指令运行时，零 Python）
 ```
@@ -95,8 +99,15 @@ python3 scripts/build.py <目录>/distill/merged.json --out <目录>/product --n
 - **数据流向**：你的聊天记录、蒸馏产物只存在于你的本地目录与你自己配置的 LLM API 之间——除你配置的 API 端点外，不向任何网络地址发送数据
 - **密钥安全**：API 密钥只从环境变量读取（`LLM_API_KEY`），不落盘、不进代码、不进日志；本仓库不包含、不引用任何密钥
 - **所有权**：蒸馏产物归你所有，可完整包含原文引用；你随时可以查看、导出、编辑或删除自己的记忆库
+- **⚠️ corpus.json 隐私警示（v2.1）**：产物目录中的 `corpus.json` 与 `merged.json` 含**全部对话原文**（原文级记忆的承诺）——**严禁上传/分享/提交到任何仓库或第三方服务**；迁移备份时同样视为敏感数据
 - **第三方隐私**：聊天记录常含第三人信息，蒸馏时会替换为占位（如"朋友A"）；蒸馏他人数据前需获得授权
 - **本仓库**：不含任何真实聊天数据；examples/ 全部为合成占位符（`__NAME__`/`__PLACE__`/`__DATE__`）
+
+## 变更记录
+
+- **v2.1（2026-08-16）**：跨文件重叠去重（同文件内重复保留，不再误杀同分钟连发）；时区输入保留本地时间（不再 -8h 偏移）；媒体消息统一 kind=placeholder；会话内断点续传恢复点=最小未完成段（不跳段）；storage 检索线性化（1 万条查询 ~80ms）；统计口径用排除 ≤1 字短消息的句长中位数；并发退避加 jitter；build 快照先更新 meta 再复制（快照内 meta 一致）；install.sh 兼容 macOS（无 timeout）与 pip 错误诊断日志；30 项实测+评审问题修复；pytest 33 例全绿
+- **v2.0**：断点续传/校验/去重/并发/情感解码等第一轮实测修复（详见 GitHub 提交历史）
+- **v1.0**：初始发布
 
 ## 目录结构
 

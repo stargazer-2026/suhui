@@ -97,10 +97,22 @@ def seg_by_count(msgs, n):
 
 
 def sample_even(msgs, k):
-    if len(msgs) <= k:
+    """均匀抽样 k 条（v2.1 P1-8）：保证 k 个不同索引（原 round 步长可能取重）。"""
+    n = len(msgs)
+    if n <= k:
         return msgs
-    idxs = set(round(i * (len(msgs) - 1) / (k - 1)) for i in range(k))
-    return [m for i, m in enumerate(msgs) if i in idxs]
+    if k <= 1:
+        return [msgs[0]]
+    idxs = sorted({min(n - 1, int(round(i * (n - 1) / (k - 1)))) for i in range(k)})
+    # 若取重导致不足 k 个：向最大空隙插入中点补齐
+    while len(idxs) < k:
+        gaps = [(idxs[i + 1] - idxs[i], i) for i in range(len(idxs) - 1)]
+        _, i = max(gaps)
+        mid = (idxs[i] + idxs[i + 1]) // 2
+        if mid == idxs[i]:
+            mid += 1
+        idxs.insert(i + 1, min(n - 1, mid))
+    return [msgs[i] for i in idxs]
 
 
 # ---------- 统计 ----------
@@ -316,10 +328,11 @@ def main(argv=None):
     ap.add_argument("--max-messages", type=int, default=None,
                     help="按消息数硬切（token 预算：每段 ≤ 模型上下文的一半）")
     ap.add_argument("--days", action="store_true",
-                    help="按活跃间隔切段（默认 12 小时；v2 语义：23:00-01:00 的"
-                         "跨午夜连续对话不切断，避免损失深夜场景样本）")
+                    help="（已弃用，等价 --active-gap）按活跃间隔切段："
+                         "23:00-01:00 的跨午夜连续对话不切断（v2 语义）")
     ap.add_argument("--active-gap", action="store_true",
-                    help="同 --days（按活跃间隔切段）")
+                    help="按活跃间隔切段（默认 6 小时；跨午夜连续对话不切断，"
+                         "避免损失深夜场景样本）")
     ap.add_argument("--active-gap-minutes", type=int, default=360,
                     help="活跃间隔分钟数（默认 360=6h；连续对话中断超过该间隔才切新段，"
                          "跨午夜连续对话不切断）")

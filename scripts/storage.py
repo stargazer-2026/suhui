@@ -138,6 +138,44 @@ class Store:
         self.table = None
         self.embedding = _check_embedding_available(data_dir)
         self._conn = None
+        # v2.1（P0-5）：预计算索引缓存（导入后重建，查询 O(1) 读取）
+        self._lex = None        # {"idf", "doc_terms", "avgdl", "docs"}
+        self._entity_count = {}  # 实体 → 含该实体的消息数（竞争性干扰密度）
+        self._clusters = []      # 世界树簇（实体→memories，P2-23 统一粒度）
+
+    def _rebuild_index(self):
+        """从 sqlite 全表重建检索索引（导入/重置后调用，查询不再全表扫描）。"""
+        conn = self._sqlite()
+        rows = conn.execute(
+            "SELECT id,text,entities,world,situation FROM memories").fetchall()
+        docs, doc_terms = [], {}
+        df = Counter()
+        for rid, text, entities, world, sit in rows:
+            terms = Counter(_tokens(text or ""))
+            doc_terms[rid] = terms
+            for t in terms:
+                df[t] += 1
+            docs.append((rid, text))
+        n = max(1, len(docs))
+        idf = {t: math.log(1 + (n - c + 0.5) / (c + 0.5)) for t, c in df.items()}
+        avgdl = sum(sum(t.values()) for t in doc_terms.values()) / n
+        self._lex = {"idf": idf, "doc_terms": doc_terms, "avgdl": avgdl,
+                     "docs": docs}
+        # 实体密度（竞争性干扰）：实体 → 含该实体的消息数
+        self._entity_count = Counter()
+        for _rid, _text, entities, _w, _s in rows:
+            for e in json.loads(entities or "[]"):
+                self._entity_count[e] += 1
+        # 世界树簇：实体 → 消息列表（P2-23：与世界树检索粒度统一）
+        cluster_map = {}
+        for rid, text, entities, world, sit in rows:
+            for e in json.loads(entities or "[]"):
+                c = cluster_map.setdefault(e, {
+                    "entity": e, "aliases": [], "world": world,
+                    "situations": (sit or "").split(","),
+                    "memories": []})
+                c["memories"].append({"text": (text or "")[:120]})
+        self._clusters = list(cluster_map.values())
 
     def _sqlite(self):
         if self._conn is None:
@@ -219,6 +257,7 @@ class Store:
             n += 1
         conn.commit()
         print("已导入 %d 条消息（含实体标签）" % n)
+        self._rebuild_index()  # v2.1（P0-5）：预计算索引，查询不再全表扫描
 
         if HAVE_LANCEDB:
             try:
@@ -264,6 +303,10 @@ class Store:
         return 0
 
     def search(self, query, topk=5, platform=None):
+        """三通道混合检索（v2.1 P0-5）：词索引/密度/簇均为导入时预计算，
+        查询 O(rows×k) 评分，不再全表嵌套扫描（原 O(N²)）。"""
+        if self._lex is None:
+            self._rebuild_index()
         conn = self._sqlite()
         sql = ("SELECT id,ts,sender,text,type,platform,entities,world,situation,"
                "emotion,importance FROM memories")
@@ -276,31 +319,23 @@ class Store:
             return []
 
         q_terms = Counter(_tokens(query))
-        docs = [(r[0], r[3]) for r in rows]
-        idf, doc_terms = _build_lexical(docs)
-        avgdl = sum(sum(t.values()) for t in doc_terms.values()) / max(1, len(docs))
+        idf, doc_terms, avgdl = (self._lex["idf"], self._lex["doc_terms"],
+                                 self._lex["avgdl"])
 
-        # 世界树分数（实体/情境/世界命中）
-        wt_scores = {}
-        clusters = self._load_clusters_for(rows)
-        if clusters:
-            wt = WorldTree(clusters)
-            for r in rows:
-                entities = json.loads(r[6] or "[]")
-                score = 0.0
-                for c in wt.hit_entities(query):
-                    if c.get("entity") in entities:
-                        score += 2.0
-                for sit in wt.hit_situations(query):
-                    if sit in (r[7] or ""):
-                        score += 1.5
-                if score > 0:
-                    wt_scores[r[0]] = score
+        # 世界树分数（实体/情境命中；簇为预构建的统一粒度）
+        wt = WorldTree(self._clusters) if self._clusters else None
+        hit_sits = set()
+        hit_ents = []
+        if wt:
+            hit_ents = wt.hit_entities(query)
+            hit_sits = set(wt.hit_situations(query))
 
+        # bm25 归一化基准（单次扫描，非嵌套）
         best_bm = 0.0
         for r in rows:
-            best_bm = max(best_bm, _bm25_score(q_terms, doc_terms.get(r[0], {}),
-                                               idf, avgdl))
+            b = _bm25_score(q_terms, doc_terms.get(r[0], {}), idf, avgdl)
+            if b > best_bm:
+                best_bm = b
         best_bm = max(1e-9, best_bm)
 
         scored = []
@@ -308,21 +343,21 @@ class Store:
             rid, _ts, _s, text, _t, plat, entities_raw, _w, sit, emo, imp = r
             entities = json.loads(entities_raw or "[]") or []
             bm = _bm25_score(q_terms, doc_terms.get(rid, {}), idf, avgdl)
-            wts = wt_scores.get(rid, 0.0)
+            wts = 0.0
+            for c in hit_ents:
+                if c.get("entity") in entities:
+                    wts += 2.0
+            for s in hit_sits:
+                if s in (sit or ""):
+                    wts += 1.5
             vec = 0.0  # 无真实 embedding 时向量通道为 0（不假装语义）
             score = (DEFAULT_WEIGHTS["vector"] * vec
                      + DEFAULT_WEIGHTS["bm25"] * (bm / best_bm)
                      + DEFAULT_WEIGHTS["worldtree"] * min(1.0, wts / 2.0))
-            # 竞争性干扰：同实体簇密度惩罚
+            # 竞争性干扰：同实体簇密度（预计算 O(1)，原全表扫描 O(N)）
             density = 0
-            if entities:
-                dens = Counter()
-                for r2 in rows:
-                    e2 = json.loads(r2[6] or "[]")
-                    for e in entities:
-                        if e in e2:
-                            dens[e] += 1
-                density = max(dens.values())
+            for e in entities:
+                density = max(density, self._entity_count.get(e, 0))
             score -= GAMMA * math.log1p(max(1, density)) * 0.15
             score += BETA * (imp or 0) + ALPHA * (abs(emo or 0) / 10.0) * 0.1
             if score > 0:
@@ -333,21 +368,6 @@ class Store:
             out.append({"score": round(score, 4), "ts": r[1], "sender": r[2],
                         "text": (r[3] or "")[:120], "platform": r[5],
                         "entities": json.loads(r[6] or "[]")})
-        return out
-
-    def _load_clusters_for(self, rows):
-        clusters = []
-        for r in rows:
-            for e in json.loads(r[6] or "[]"):
-                clusters.append({"entity": e, "aliases": [], "world": r[7],
-                                 "situations": (r[8] or "").split(","),
-                                 "memories": [{"text": r[3]}]})
-        seen, out = set(), []
-        for c in clusters:
-            k = (c["entity"], c["world"])
-            if k not in seen:
-                seen.add(k)
-                out.append(c)
         return out
 
 

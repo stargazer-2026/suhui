@@ -28,18 +28,50 @@ def test_encoding_gbk(tmp_path):
     assert msgs[0]["text"].startswith("早上好")
 
 
-# ---------- 去重（P0-3） ----------
-def test_dedup_same_platform():
+# ---------- 去重（v2.1 P0-1：跨文件重叠去重） ----------
+def test_dedup_same_file_kept():
+    """同文件内重复保留（真实对话：同分钟连发相同文本不被误杀）"""
+    msgs = [
+        {"platform": "wechat", "ts": "2030-01-01T10:00:00", "sender": "A",
+         "text": "晚安", "file_id": 0},
+        {"platform": "wechat", "ts": "2030-01-01T10:00:00", "sender": "A",
+         "text": "晚安", "file_id": 0},  # 同文件重复 → 保留
+        {"platform": "wechat", "ts": "2030-01-01T10:01:00", "sender": "A",
+         "text": "晚安", "file_id": 0},
+    ]
+    out, removed = parse.dedup_messages(msgs)
+    assert removed == 0
+    assert len(out) == 3
+
+
+def test_dedup_cross_file():
+    """跨文件（重复导出）重叠 → 去重；同文件内重复保留"""
+    msgs = [
+        # 文件0：同 key 出现两次（同文件重复 → 都保留）
+        {"platform": "wechat", "ts": "2030-01-01T10:00:00", "sender": "A",
+         "text": "在吗", "file_id": 0},
+        {"platform": "wechat", "ts": "2030-01-01T10:00:00", "sender": "A",
+         "text": "在吗", "file_id": 0},
+        # 文件1：与文件0 重叠（重复导出）→ 文件1 的该 key 全部去重
+        {"platform": "wechat", "ts": "2030-01-01T10:00:00", "sender": "A",
+         "text": "在吗", "file_id": 1},
+    ]
+    out, removed = parse.dedup_messages(msgs)
+    assert removed == 1
+    assert len(out) == 2
+    assert all(m["file_id"] == 0 for m in out)
+
+
+def test_dedup_no_file_id_kept():
+    """无 file_id 保守保留"""
     msgs = [
         {"platform": "wechat", "ts": "2030-01-01T10:00:00", "sender": "A",
          "text": "在吗"},
         {"platform": "wechat", "ts": "2030-01-01T10:00:00", "sender": "A",
-         "text": "在吗"},  # 重复
-        {"platform": "wechat", "ts": "2030-01-01T10:01:00", "sender": "A",
-         "text": "在吗"},  # ts 不同 → 保留
+         "text": "在吗"},
     ]
     out, removed = parse.dedup_messages(msgs)
-    assert removed == 1
+    assert removed == 0
     assert len(out) == 2
 
 
@@ -47,9 +79,9 @@ def test_dedup_cross_platform_kept():
     """跨平台不去重（多面性素材）"""
     msgs = [
         {"platform": "wechat", "ts": "2030-01-01T10:00:00", "sender": "A",
-         "text": "在吗"},
+         "text": "在吗", "file_id": 0},
         {"platform": "telegram", "ts": "2030-01-01T10:00:00", "sender": "A",
-         "text": "在吗"},
+         "text": "在吗", "file_id": 1},
     ]
     out, removed = parse.dedup_messages(msgs)
     assert removed == 0
@@ -61,6 +93,22 @@ def test_kind_placeholder():
     assert parse.detect_kind("[图片]") == "placeholder"
     assert parse.detect_kind("[表情]") == "placeholder"
     assert parse.detect_kind("[语音]") == "placeholder"
+
+
+def test_kind_placeholder_sequence():
+    """v2.1（P1-7）：连发占位符序列整条判 placeholder"""
+    assert parse.detect_kind("[图片][图片]") == "placeholder"
+    assert parse.detect_kind("[表情][语音][图片]") == "placeholder"
+
+
+def test_kind_media_message():
+    """v2.1（P0-6）：媒体消息（照片节点/媒体占位）kind=placeholder 不进文本统计"""
+    m = parse.make_msg("2030-01-01T10:00:00", None, "照片: img_001.tif",
+                       "image", "photos")
+    assert m["kind"] == "placeholder"
+    m2 = parse.make_msg("2030-01-01T10:00:00", "A", "[photo_1.jpg]",
+                        "file", "telegram")
+    assert m2["kind"] == "placeholder"
 
 
 def test_kind_emoji():
@@ -95,7 +143,8 @@ def test_timestamp_slash():
 
 
 def test_timestamp_tz_iso():
-    assert parse.parse_iso("2023-09-27T21:00:00+08:00") == "2023-09-27T13:00:00"
+    """v2.1（P0-4）：保留本地时间原样输出，不转 UTC"""
+    assert parse.parse_iso("2023-09-27T21:00:00+08:00") == "2023-09-27T21:00:00"
     assert parse.parse_iso("2023-09-27T21:00:00Z") == "2023-09-27T21:00:00"
 
 
@@ -103,7 +152,7 @@ def test_timestamp_tz_line():
     m = parse.TS_LINE_RE.match("2023-09-27T21:00:00+08:00 __NAME__: 在吗")
     assert m is not None
     ts = parse.fmt_ts(*m.groups()[:6], tz=m.groups()[6])
-    assert ts == "2023-09-27T13:00:00"
+    assert ts == "2023-09-27T21:00:00"  # 本地时间保留（深夜统计不偏移）
 
 
 # ---------- 多行合并 + 流式（P1-6） ----------
@@ -126,6 +175,30 @@ def test_stream_large():
     assert msgs[-1]["text"] == "第24999条\n续行24999"
 
 
+def test_single_timestamp_not_fallback(tmp_path):
+    """v2.1：仅 1 条时间戳消息的文件不被 plain_txt fallback 覆盖（时间戳保留）"""
+    src = tmp_path / "one.txt"
+    src.write_text("2023-09-27T21:00:00+08:00 __NAME__: 在吗\n", encoding="utf-8")
+    out = tmp_path / "out_one"
+    rc = parse.main([str(src), "--out", str(out)])
+    assert rc == 0
+    data = json.loads((out / "messages.json").read_text(encoding="utf-8"))
+    assert data[0]["ts"] == "2023-09-27T21:00:00"  # 保留本地时间
+    assert data[0]["text"] == "在吗"
+
+
+def test_plain_text_fallback_still_works(tmp_path):
+    """纯文本（无时间戳）仍走 fallback"""
+    src = tmp_path / "plain.txt"
+    src.write_text("__NAME__: 在吗\n我: 在\n", encoding="utf-8")
+    out = tmp_path / "out_plain"
+    rc = parse.main([str(src), "--out", str(out)])
+    assert rc == 0
+    data = json.loads((out / "messages.json").read_text(encoding="utf-8"))
+    assert len(data) == 2
+    assert all(m["ts"] is None for m in data)
+
+
 # ---------- 端到端 CLI ----------
 def test_cli_dedup_flag(tmp_path, capsys):
     src = tmp_path / "dup.txt"
@@ -136,9 +209,27 @@ def test_cli_dedup_flag(tmp_path, capsys):
                      '{"__NAME__":"B"}'])
     assert rc == 0
     data = json.loads((out / "messages.json").read_text(encoding="utf-8"))
-    assert len(data) == 1  # 默认去重
+    # v2.1（P1-15）：单文件导入 → 同文件内重复保留（真实对话），不去重
+    assert len(data) == 2
+    assert all(m.get("file_id") == 0 for m in data)
     meta = json.loads((out / "parse_meta.json").read_text(encoding="utf-8"))
-    assert any("去重" in w for w in meta["warnings"])
+    assert not any("去重" in w for w in meta["warnings"])  # 单文件无跨文件重叠
+
+
+def test_cli_dedup_cross_file(tmp_path):
+    """跨文件重叠去重：同一文件传两次 → 第二次的内容被去重"""
+    src = tmp_path / "dup.txt"
+    src.write_text("[2030-01-01 10:00] __NAME__: 在吗\n"
+                   "[2030-01-01 10:00] __NAME__: 在吗\n", encoding="utf-8")
+    out = tmp_path / "out3"
+    rc = parse.main([str(src), str(src), "--out", str(out), "--map",
+                     '{"__NAME__":"B"}'])
+    assert rc == 0
+    data = json.loads((out / "messages.json").read_text(encoding="utf-8"))
+    # 文件0 两条 + 文件1 两条（重叠两条被杀）→ 共 2 条
+    assert len(data) == 2
+    meta = json.loads((out / "parse_meta.json").read_text(encoding="utf-8"))
+    assert any("跨文件重叠" in w for w in meta["warnings"])
 
 
 def test_cli_no_dedup(tmp_path):

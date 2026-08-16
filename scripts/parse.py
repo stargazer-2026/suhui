@@ -24,7 +24,6 @@ parse.py — 聊天记录解析 → 标准消息流 JSON（§5.1）
   parse_meta.json — 解析元信息（格式/平台/发送者映射/警告）
 """
 import argparse
-import base64
 import csv
 import io
 import json
@@ -48,7 +47,6 @@ except Exception:
 
 # ---------- 常量 ----------
 PLATFORM_UNKNOWN = "unknown"
-MSG_TYPES = ("text", "emoji", "image", "system", "voice", "video", "file")
 KIND_TEXT = "text"
 KIND_PLACEHOLDER = "placeholder"
 KIND_EMOJI = "emoji"
@@ -93,19 +91,27 @@ MEDIA_TYPE_MAP = {
 # ---------- 消息模型 ----------
 def make_msg(ts, sender, text, mtype="text", platform=PLATFORM_UNKNOWN,
              kind=None):
-    """ts: ISO 字符串或 None（时间未知）；kind: text/placeholder/emoji（P0-4）。"""
+    """ts: ISO 字符串或 None（时间未知）；kind: text/placeholder/emoji。
+    v2.1（P0-6）：媒体消息（image/file/voice/video）一律 kind=placeholder——
+    照片节点与媒体占位不进入文本统计。"""
+    if kind is None:
+        if mtype in ("image", "file", "voice", "video"):
+            kind = KIND_PLACEHOLDER
+        else:
+            kind = detect_kind(text)
     return {"ts": ts, "sender": sender, "text": text, "type": mtype,
-            "platform": platform, "kind": kind or detect_kind(text)}
+            "platform": platform, "kind": kind}
 
 
 def detect_kind(text):
     """消息类别（P0-4）：占位符消息（[图片]/[表情]/[语音]…）不计入文本统计；
-    纯 emoji/kaomoji 消息单列。"""
+    纯 emoji/kaomoji 消息单列。
+    v2.1（P1-7）：支持连续占位符序列（[图片][图片] 整条全为占位符 → placeholder）。"""
     t = (text or "").strip()
     if not t:
         return KIND_TEXT
-    if re.fullmatch(r"\[(图片|照片|表情|动画表情|语音|视频|文件|红包|转账|"
-                    r"位置|名片|链接|音乐)\]", t):
+    if re.fullmatch(r"(?:\[(?:图片|照片|表情|动画表情|语音|视频|文件|红包|转账|"
+                    r"位置|名片|链接|音乐)\])+", t):
         return KIND_PLACEHOLDER
     rest = EMOJI_RE.sub("", t)
     rest = re.sub(r"[\s（()）_\-:/|\\。，！？~…、]", "", rest)
@@ -134,26 +140,10 @@ def detect_type(text):
 
 # ---------- 时间解析 ----------
 def fmt_ts(y, mo, d, h, mi, s=0, tz=None):
-    """输出 ISO 时间；tz 存在时（Z 或 ±HH:MM）转换为 UTC（P1-7）。"""
-    if tz:
-        try:
-            import datetime
-            base = datetime.datetime(int(y), int(mo), int(d), int(h),
-                                     int(mi), int(s or 0))
-            if tz in ("Z", "z"):
-                base = base.replace(tzinfo=datetime.timezone.utc)
-            else:
-                m = re.match(r"([+-])(\d{1,2}):?(\d{2})", tz)
-                if m:
-                    off = datetime.timedelta(hours=int(m.group(2)),
-                                             minutes=int(m.group(3)))
-                    if m.group(1) == "-":
-                        off = -off
-                    base = base.replace(tzinfo=datetime.timezone(off))
-            return base.astimezone(datetime.timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%S")
-        except (ValueError, TypeError, AttributeError):
-            pass
+    """输出 ISO 时间。
+    v2.1（P0-4）：tz 仅用于消费时区后缀（避免污染发送者字段），
+    **保留本地时间原样输出，不转 UTC**——+08:00 导出不被 -8 小时，
+    深夜/活跃时段统计保持正确。"""
     try:
         return "%04d-%02d-%02dT%02d:%02d:%02d" % (int(y), int(mo), int(d),
                                                    int(h), int(mi), int(s or 0))
@@ -366,7 +356,11 @@ def _from_bs4_nodes(nodes, platform):
         for prefix in (name,):
             if prefix and content.startswith(prefix):
                 content = content[len(prefix):].strip()
-        content = re.sub(r"^\d{1,2}:\d{2}\s*", "", content).strip()
+        stripped = re.sub(r"^\d{1,2}:\d{2}\s*", "", content).strip()
+        # v2.1（P2-22）：仅当剥离后内容非空才采纳（防止内容本身以时间开头被误剥，
+        # 如正文"12:00 见"；纯时间行则保留原样）
+        if stripped and stripped != content:
+            content = stripped
         if not content:
             continue
         msgs.append(make_msg(ts, name, content, detect_type(content), platform))
@@ -377,13 +371,15 @@ def _from_bs4_nodes(nodes, platform):
 def parse_telegram_json(obj, platform="telegram"):
     msgs = []
     for m in obj.get("messages", []):
-        ts = parse_iso(m.get("date") or m.get("date_unixtime") or "")
+        ts = parse_iso(m.get("date") or "")
         if not ts and m.get("date_unixtime"):
             try:
                 import datetime
-                ts = datetime.datetime.utcfromtimestamp(
+                # v2.1（P0-4）：epoch 用本机时区解读（与 date 字段的本地时间口径一致），
+                # 不用 UTC——避免深夜/活跃时段统计偏移
+                ts = datetime.datetime.fromtimestamp(
                     int(m["date_unixtime"])).strftime("%Y-%m-%dT%H:%M:%S")
-            except Exception:
+            except (ValueError, OSError):
                 ts = None
         sender = m.get("from") or m.get("from_id") or m.get("actor")
         if sender and str(sender).startswith("user"):
@@ -704,8 +700,13 @@ def normalize_senders(msgs, forced_map=None):
             mapping[name] = "B"
             used.add("B")
         else:
-            mapping[name] = next_letter
-            next_letter = chr(ord(next_letter) + 1)
+            # v2.1（P2-21）：超过 26 个发送者时用 A1/B1 风格，避免 chr 溢出
+            n = len(used) - 2
+            if n < 24:
+                mapping[name] = next_letter
+                next_letter = chr(ord(next_letter) + 1)
+            else:
+                mapping[name] = "A%d" % (n - 23)
             used.add(mapping[name])
     out = []
     for m in msgs:
@@ -737,60 +738,65 @@ def parse_files(inputs, platform=None, forced_map=None, out_dir=".",
     all_msgs = []
     warnings = []
     formats = []
-    for inp in inputs:
-        if os.path.isdir(inp):
-            msgs = parse_photo_folder(inp)
-            if not msgs:
-                warnings.append("%s: 未找到可解析的照片（支持 jpg/tif/png/heic/webp）" % inp)
+    for fid, inp in enumerate(inputs):
+        try:
+            if os.path.isdir(inp):
+                msgs = parse_photo_folder(inp)
+                if not msgs:
+                    warnings.append("%s: 未找到可解析的照片（支持 jpg/tif/png/heic/webp）" % inp)
+                else:
+                    n_ts = sum(1 for m in msgs if m["ts"])
+                    warnings.append("%s: 照片 %d 张，其中 %d 张含时间戳（EXIF）"
+                                    % (inp, len(msgs), n_ts))
+                formats.append("photos")
             else:
-                n_ts = sum(1 for m in msgs if m["ts"])
-                warnings.append("%s: 照片 %d 张，其中 %d 张含时间戳（EXIF）"
-                                % (inp, len(msgs), n_ts))
-            formats.append("photos")
-            all_msgs.extend(msgs)
-        else:
-            try:
                 # 格式嗅探只读文件头（P1-6：大导出不整读）
                 with open(inp, "rb") as f:
                     head_bytes = f.read(8192)
-            except OSError as e:
-                sys.stderr.write("无法读取文件 %s: %s\n" % (inp, e))
-                return 1
-            head_text = head_bytes.decode(detect_encoding(head_bytes),
-                                          errors="replace")[:2000]
-            fmt = sniff_format(inp, head_text, False)
-            formats.append(fmt)
-            pfx = _effective_platform(fmt, platform)
-            if fmt == "txt_timeline":
-                with open_text_stream(inp) as f:
-                    msgs = _parse_txt_lines(f, pfx)
-            elif fmt == "html":
-                msgs = parse_html(read_text(inp), pfx)
-            elif fmt == "telegram_json":
-                import json as _json
-                try:
-                    msgs = parse_telegram_json(_json.loads(read_text(inp)), pfx)
-                except ValueError:
-                    msgs = []
-            elif fmt == "twitter_js":
-                msgs = parse_twitter_js(read_text(inp))
-            elif fmt == "sms_csv":
-                msgs = parse_sms_csv(read_text(inp), pfx)
-            elif fmt == "generic_json":
-                msgs = parse_generic_json(read_text(inp), pfx)
-            else:  # plain_txt
-                with open_text_stream(inp) as f:
-                    msgs = _parse_txt_lines(f, pfx)
-                if len([m for m in msgs if m["ts"]]) < 2:
+                head_text = head_bytes.decode(detect_encoding(head_bytes),
+                                              errors="replace")[:2000]
+                fmt = sniff_format(inp, head_text, False)
+                formats.append(fmt)
+                pfx = _effective_platform(fmt, platform)
+                if fmt == "txt_timeline":
                     with open_text_stream(inp) as f:
-                        msgs = _parse_plain_fallback(f, pfx)
-            if not msgs:
-                warnings.append("%s: 格式(%s)未解析出消息——该文件格式异常，请提供 txt 导出"
-                                % (inp, fmt))
-            else:
-                warnings.append("%s: 格式(%s) 解析出 %d 条消息"
-                                % (inp, fmt, len(msgs)))
-            all_msgs.extend(msgs)
+                        msgs = _parse_txt_lines(f, pfx)
+                elif fmt == "html":
+                    msgs = parse_html(read_text(inp), pfx)
+                elif fmt == "telegram_json":
+                    import json as _json
+                    try:
+                        msgs = parse_telegram_json(_json.loads(read_text(inp)), pfx)
+                    except ValueError:
+                        msgs = []
+                elif fmt == "twitter_js":
+                    msgs = parse_twitter_js(read_text(inp))
+                elif fmt == "sms_csv":
+                    msgs = parse_sms_csv(read_text(inp), pfx)
+                elif fmt == "generic_json":
+                    msgs = parse_generic_json(read_text(inp), pfx)
+                else:  # plain_txt
+                    with open_text_stream(inp) as f:
+                        msgs = _parse_txt_lines(f, pfx)
+                    if len([m for m in msgs if m["ts"]]) < 1:
+                        # v2.1：仅当没有任何时间戳时才走纯文本回退——
+                        # 否则会覆盖已解析的时间戳消息（1 条时间戳也保留）
+                        with open_text_stream(inp) as f:
+                            msgs = _parse_plain_fallback(f, pfx)
+                if not msgs:
+                    warnings.append("%s: 格式(%s)未解析出消息——该文件格式异常，请提供 txt 导出"
+                                    % (inp, fmt))
+                else:
+                    warnings.append("%s: 格式(%s) 解析出 %d 条消息"
+                                    % (inp, fmt, len(msgs)))
+        except Exception as e:
+            # v2.1（P1-14）：单文件异常不中断整体解析——跳过并 warning
+            msgs = []
+            warnings.append("%s: 解析异常已跳过（%s: %s）" % (inp, type(e).__name__, e))
+        # v2.1（P0-1）：每条消息标记来源文件索引（跨文件重叠去重依据）
+        for m in msgs:
+            m["file_id"] = fid
+        all_msgs.extend(msgs)
 
     if not all_msgs:
         sys.stderr.write("错误：未能从输入解析出任何消息。\n"
@@ -807,12 +813,14 @@ def parse_files(inputs, platform=None, forced_map=None, out_dir=".",
     keyed.sort(key=lambda x: (x[0] == "", x[0], x[1]))
     all_msgs = [k[2] for k in keyed]
 
-    # 同平台重复导出去重（P0-3，默认开；跨平台差异保留）
+    # 跨文件重叠去重（P0-1，默认开：重复导出文件间重叠消息去重；
+    # 同文件内重复保留——真实对话；跨平台差异保留）
     if dedup:
         all_msgs, removed = dedup_messages(all_msgs)
         if removed:
-            warnings.append("同平台重复消息去重 %d 条（跨平台差异保留——"
-                            "不同平台的表达差异是多面性素材）" % removed)
+            warnings.append("跨文件重叠消息去重 %d 条（同文件内重复保留；"
+                            "跨平台差异保留——不同平台的表达差异是多面性素材）"
+                            % removed)
 
     messages_path = os.path.join(out_dir, "messages.json")
     with open(messages_path, "w", encoding="utf-8") as f:
@@ -845,18 +853,27 @@ def parse_files(inputs, platform=None, forced_map=None, out_dir=".",
 
 
 def dedup_messages(msgs):
-    """同平台重复导出去重（P0-3）：按 (platform, ts, sender, text) 哈希。
+    """跨文件重叠去重（v2.1 P0-1）：
+    - 消息带 file_id（来源文件索引）时：同 key(platform,ts,sender,text) 出现在
+      **不同文件**（重复导出）才去重；同文件内重复保留（真实对话，如同分钟连发"晚安"）
+    - 无 file_id：保守保留（不去重）
+    - 单文件导入：所有消息同 file_id → 去重完全失效（正确：单文件无重叠可言）
     跨平台不去重——同一内容在不同平台的表达差异是她的多面性素材。"""
-    seen = set()
+    seen = {}  # key -> file_id
     out = []
     removed = 0
     for m in msgs:
+        fid = m.get("file_id")
         key = (m.get("platform"), m.get("ts"), m.get("sender"),
                m.get("text"))
         if key in seen:
-            removed += 1
+            if fid is not None and seen[key] != fid:
+                removed += 1
+                continue  # 跨文件重叠：杀
+            # 同文件重复或无 file_id：保留（真实对话）
+            out.append(m)
             continue
-        seen.add(key)
+        seen[key] = fid
         out.append(m)
     return out, removed
 
@@ -897,8 +914,8 @@ def _parse_plain_fallback(lines, platform):
                 cur["_parts"] = [line]
     flush()
     if len(msgs) == 1 and msgs[0]["sender"] is None:
-        # 完全无法切分：保留原文不丢，标记时间未知
-        msgs[0]["text"] = "\n".join(msgs[0]["text"].split("\n"))
+        # 完全无法切分：保留原文不丢，标记时间未知（text 已含全部行）
+        pass
     return msgs
 
 
@@ -911,8 +928,8 @@ def main(argv=None):
     ap.add_argument("--map", default=None,
                     help='锚点发送者映射，如 \'{"小美":"B","我":"A"}\'（§8 多段校准）')
     ap.add_argument("--dedup", dest="dedup", action="store_true", default=True,
-                    help="同平台重复导出去重（按 platform+ts+sender+text，默认开；"
-                         "跨平台差异保留）")
+                    help="跨文件重叠去重（重复导出的文件间重叠消息去重；"
+                         "同文件内重复保留，默认开；--no-dedup 关闭）")
     ap.add_argument("--no-dedup", dest="dedup", action="store_false",
                     help="关闭去重（多平台混用时保留全部）")
     args = ap.parse_args(argv)

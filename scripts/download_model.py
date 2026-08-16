@@ -32,7 +32,7 @@ def fetch(url, dest):
     print("  下载 %s" % url)
     tmp = dest + ".part"
     req = urllib.request.Request(url, headers={"User-Agent": "suhui-downloader"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:  # v2.1 P2-17：90MB 模型放宽超时
         with open(tmp, "wb") as f:
             while True:
                 chunk = resp.read(65536)

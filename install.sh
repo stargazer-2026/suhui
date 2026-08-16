@@ -51,7 +51,8 @@ else
 fi
 
 # ---------- 2. 安装产物（主任务，立即完成） ----------
-SLUG=$(sed -n 's/^name: *//p' "$PRODUCT_DIR/SKILL.md" | head -1 | tr -d ' "'"'"'')
+SLUG=$(sed -n 's/^name: *//p' "$PRODUCT_DIR/SKILL.md" | head -1 \
+       | tr -d ' "'"'"'' | tr -d "\"'")
 SLUG=${SLUG:-ex-$(date +%s)}
 if [[ -z "$SKILLS_DIR" ]]; then
   for cand in "$HOME/.claude/skills" "$HOME/.openclaw/skills" "$HOME/.config/skills" "$PWD/skills"; do
@@ -90,14 +91,25 @@ if ! command -v pip3 >/dev/null 2>&1 && ! python3 -m pip --version >/dev/null 2>
   exit 0
 fi
 
+# 跨平台超时命令（v2.1 P1-12：macOS 无 timeout）
+if command -v timeout >/dev/null 2>&1; then
+  run_with_timeout() { timeout "$@"; }
+else
+  run_with_timeout() { shift; "$@"; }  # 无 timeout：忽略秒数直接执行
+fi
+
 PIP="python3 -m pip install --quiet"
-pip_try() { # $1=pip args
+pip_try() { # $1=pip args；错误输出保留到日志（P2-20）
+  local log
+  log="$(mktemp /tmp/suhui-pip.XXXXXX.log)"
   if command -v pip3 >/dev/null 2>&1; then
-    pip3 install --quiet "$@" 2>/dev/null && return 0
-    pip3 install --quiet --break-system-packages "$@" 2>/dev/null && return 0
+    pip3 install --quiet "$@" >"$log" 2>&1 && { rm -f "$log"; return 0; }
+    pip3 install --quiet --break-system-packages "$@" >"$log" 2>&1 && { rm -f "$log"; return 0; }
   fi
-  python3 -m pip install --quiet "$@" 2>/dev/null && return 0
-  python3 -m pip install --quiet --break-system-packages "$@" 2>/dev/null
+  python3 -m pip install --quiet "$@" >"$log" 2>&1 && { rm -f "$log"; return 0; }
+  python3 -m pip install --quiet --break-system-packages "$@" >"$log" 2>&1 && { rm -f "$log"; return 0; }
+  warn "安装失败，诊断日志: $log（可查看具体原因后重试）"
+  return 1
 }
 
 has() { python3 -c "import $1" >/dev/null 2>&1; }
@@ -148,7 +160,7 @@ if [[ -f "$MODELS_DIR/model.safetensors" && -f "$MODELS_DIR/tokenizer.json" ]]; 
   ok "中文语义模型已就绪（全本地，免费隐私）"
 else
   say "  正在下载中文语义模型（约 90MB，本地存储）..."
-  if timeout 120 python3 "$(dirname "$0")/scripts/download_model.py" --dir "$MODELS_DIR" >/dev/null 2>&1; then
+  if run_with_timeout 120 python3 "$(dirname "$0")/scripts/download_model.py" --dir "$MODELS_DIR" >/dev/null 2>&1; then
     ok "中文语义模型已就绪（全本地，免费隐私）"
   else
     warn "中文语义模型未就绪——已自动降级为基础联想模式（世界树+词面，核心像度机制不受影响）。"
@@ -165,7 +177,7 @@ fi
 if [[ "$NEED_VEC" == "1" ]]; then
   if [[ "$WITH_VECTOR" == "1" ]]; then
     say "  正在补装语义联想增强组件（约 1GB，可能需要几分钟）..."
-    if timeout 240 pip_try sentence-transformers; then
+    if run_with_timeout 240 pip_try sentence-transformers; then
       ok "语义联想增强组件已就绪（本地向量档全开：向量+词面+世界树三通道检索）"
     else
       warn "语义联想增强组件安装超时/失败——已自动降级为基础联想模式（不影响核心像度机制：口癖/句长/emoji/节奏/世界树联想全部可用）。"

@@ -25,6 +25,7 @@ import argparse
 import datetime
 import json
 import os
+import random
 import re
 import sys
 import threading
@@ -118,7 +119,7 @@ def _retry_delay(attempt, exc):
             except ValueError:
                 pass
         return 30  # 429 无 Retry-After：较长退避
-    return 2 ** (attempt - 1)
+    return 2 ** (attempt - 1) + random.uniform(0, 0.5)  # v2.1 P2-19：并发退避加 jitter
 
 
 def is_retryable(e):
@@ -183,13 +184,17 @@ def stats_summary(stats):
     if stats.get("span"):
         L.append("时间跨度: %s → %s" % (stats["span"].get("start"), stats["span"].get("end")))
     L.append("消息长度百分位(字符): %s" % json.dumps(stats.get("message_length_percentiles") or {}))
-    L.append("B 的句长百分位: %s" % json.dumps(stats.get("sender_len_B") or {}))
+    L.append("B 的句长百分位(排除≤1字短消息, v2.1): %s"
+             % json.dumps(stats.get("sender_len_B_main")
+                          or stats.get("sender_len_B") or {}))
     L.append("B 的深夜(22-2点)消息占比: %s" % stats.get("night_ratio_B"))
     L.append("B 回复 A 的中位延迟(秒): %s" % (stats.get("reply_delay_seconds") or {}).get("50"))
-    L.append("高频词(全部): %s" % json.dumps(
+    L.append("高频词(全部, 排除占位符): %s" % json.dumps(
         [p["phrase"] for p in (stats.get("top_phrases") or [])[:15]], ensure_ascii=False))
     L.append("B 的高频词: %s" % json.dumps(
         [p["phrase"] for p in (stats.get("top_phrases_B") or [])[:15]], ensure_ascii=False))
+    L.append("B 的经典语录(低频完整句): %s" % json.dumps(
+        [p["quote"] for p in (stats.get("top_quotes_B") or [])[:8]], ensure_ascii=False))
     L.append("A 的高频词: %s" % json.dumps(
         [p["phrase"] for p in (stats.get("top_phrases_A") or [])[:15]], ensure_ascii=False))
     L.append("高频 emoji: %s" % json.dumps(stats.get("emoji_frequency") or {}, ensure_ascii=False))
@@ -249,7 +254,7 @@ def offline_distill(segments, stats, name=""):
         seg_texts.append(format_segment_text(seg["messages"]))
 
     ph = [p["phrase"] for p in (stats.get("top_phrases_B") or [])[:6]]
-    her_len = stats.get("sender_len_B") or {}
+    her_len = stats.get("sender_len_B_main") or stats.get("sender_len_B") or {}
     med_len = her_len.get("50")
     night = stats.get("night_ratio_B")
     initiators = stats.get("conversation_initiators") or {}

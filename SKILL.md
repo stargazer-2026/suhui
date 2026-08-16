@@ -19,7 +19,7 @@ user-invocable: true
 
 - **Step 0 配置**：提示设置环境变量（LLM_API_KEY 等）；检测到已配置则自动跳过
 - **Step 0.5 版本选择**：「完整版（默认，功能全）还是轻量版（省 token）？不知道就默认完整版。」之后「换轻量版/换完整版」随时切换（等价于 /switch）
-- **Step 1 上传记录**：导入方式菜单 A-F（A 微信导出 / B iMessage/短信 / C 照片 EXIF 时间线 / D 社交媒体导出 / E 其他文件 / F 直接粘贴）——可混用可跳过；多文件时间线合并；**同一平台重复导出自动去重（按 ts+sender+text，v2 默认开）**，跨平台差异保留（多面性素材）；占位符消息（[图片]/[表情]…）自动标记不计入文本统计；导入后统计反馈（"共解析 X 条消息，时间跨度 A→B，发送者 2 人"）
+- **Step 1 上传记录**：导入方式菜单 A-F（A 微信导出 / B iMessage/短信 / C 照片 EXIF 时间线 / D 社交媒体导出 / E 其他文件 / F 直接粘贴）——可混用可跳过；多文件时间线合并；**跨文件重叠去重（v2.1：重复导出的文件间重叠消息去重，同文件内重复保留——真实对话不被误杀）**，跨平台差异保留（多面性素材）；占位符消息（[图片]/[表情]…）自动标记不计入文本统计；导入后统计反馈（"共解析 X 条消息，时间跨度 A→B，发送者 2 人"）
 - **Step 2 基础信息**（三个问题，每个可单独跳过）：Q1 昵称/代号；Q2 一句话 4 件事（在一起多久/怎么认识的/分手多久/她做什么的）；Q3 性格画像——记录不足时自动进入访谈补充（以她身份+记忆模糊方式提问：「我们是怎么认识的来着？我记得不太清了，你告诉我？」）
 - **Step 3 蒸馏（核心）**：会话内完成（无需任何密钥）——分批读文件→按模板逐批蒸馏（进度：当前段数/总段数）→合并；**断点续传（v2）：蒸馏前写 progress.json（scripts/progress.py init <目录> <总段数>），每段完成 update；会话中断后重新加载，先读 progress.json 恢复——已完成的段不重蒸**；可中断续传；<100 条提示"记录偏少，蒸馏可能不够像，建议补充材料"；脚本路径（distill.py）为可选
 - **Step 4 产物预览**：memories/persona 摘要（各 5-8 行）+ 抽查对照（证据链）；问"确认生成还是调整"
@@ -45,12 +45,12 @@ user-invocable: true
 ## 蒸馏工具链（可选脚本路径）
 
 ```bash
-python3 scripts/parse.py <聊天记录> --out <目录>          # 解析 → messages.json（--dedup 默认开，--no-dedup 关闭）
-python3 scripts/segment.py <目录>/messages.json --out <目录>  # 切段+统计（--days=活跃间隔切段，跨午夜不切断）
+python3 scripts/parse.py <聊天记录> --out <目录>          # 解析 → messages.json（--dedup 默认开：跨文件重叠去重，同文件重复保留）
+python3 scripts/segment.py <目录>/messages.json --out <目录>  # 切段+统计（--active-gap 活跃间隔切段，跨午夜不切断）
 python3 scripts/distill.py <目录>/segments.json <目录>/stats.json prompts/ --out <目录>/distill --name 名字  # 可加 --parallel N
-python3 scripts/validate.py <目录>/distill              # 段产物校验（v2：JSON 语法+字段完整性+证据分级）
-python3 scripts/build.py <目录>/distill/merged.json --out <目录>/product --name 名字  # 自动版本快照 snapshots/vN
-python3 scripts/progress.py show <目录>                  # 会话内蒸馏进度（v2 断点续传）
+python3 scripts/validate.py <目录>/distill              # 段产物校验（JSON 语法+字段完整性+证据分级）
+python3 scripts/build.py <目录>/distill/merged.json --out <目录>/product --name 名字 --slug 可读名  # 自动版本快照 snapshots/vN
+python3 scripts/progress.py show <目录>                  # 会话内蒸馏进度（断点续传）
 ./install.sh <目录>/product                              # 安装到 skills 目录
 ```
 

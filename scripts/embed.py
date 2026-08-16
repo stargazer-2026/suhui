@@ -53,6 +53,8 @@ def encode_api(texts):
     ep = os.environ.get("SUHUI_EMBEDDING", "").strip()
     if not ep:
         raise RuntimeError("SUHUI_EMBEDDING 未配置")
+    # v2.1（P2-18）：端点需自带鉴权（如 URL 内嵌 key 或网关层认证）——
+    # 本脚本不注入任何密钥；请求头不含 Authorization
     body = {"input": texts}
     req = urllib.request.Request(
         ep, data=json.dumps(body).encode("utf-8"),

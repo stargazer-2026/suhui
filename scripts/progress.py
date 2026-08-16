@@ -71,7 +71,9 @@ def cmd_update(args):
     if sid not in prog["done"]:
         prog["done"].append(sid)
         prog["done"].sort()
-    prog["current"] = max(prog["current"], sid + 1)
+    # v2.1（P0-3）：current = 最小未完成段号（done 不连续时不跳段）
+    missing = [i for i in range(prog["total_segments"]) if i not in prog["done"]]
+    prog["current"] = missing[0] if missing else prog["total_segments"]
     prog["updated"] = _now()
     save(args.dir, prog)
     print("段 %d 完成：%d/%d → %s" % (sid, len(prog["done"]),
@@ -84,14 +86,21 @@ def cmd_show(args):
     print("会话内蒸馏进度（%s）" % _path(args.dir))
     print("  总段数: %d" % prog["total_segments"])
     print("  已完成: %s" % (prog["done"] or "无"))
-    print("  当前段: %d" % prog["current"])
     print("  合并: %s" % ("已完成" if prog["merged"] else "未完成"))
-    if prog["done"]:
-        nxt = max(prog["done"]) + 1
-        if nxt < prog["total_segments"]:
-            print("  恢复: 从段 %d 继续（已完成的段不重蒸）" % nxt)
-        else:
-            print("  恢复: 全部段已完成，进入合并")
+    if prog["merged"]:
+        print("  恢复: 全部段已完成并合并，直接开始对话")
+        return 0
+    missing = [i for i in range(prog["total_segments"]) if i not in prog["done"]]
+    if not missing:
+        print("  恢复: 全部段已完成，进入合并")
+        return 0
+    nxt = missing[0]
+    print("  恢复: 从段 %d 继续（最小未完成段，已完成的段不重蒸）" % nxt)
+    if len(missing) > 1:
+        shown = ", ".join(str(i) for i in missing[:10])
+        more = "…" if len(missing) > 10 else ""
+        print("  ⚠ 缺失/未完成段: [%s%s]（共 %d 段；这些段会蒸馏，其余跳过）"
+              % (shown, more, len(missing)))
     return 0
 
 

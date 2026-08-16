@@ -164,25 +164,47 @@ def cmd_switch(args):
 
 
 def cmd_export_backup(args):
+    """v2.1（P2-24）：配置 + 产物整体导出（SKILL.md 承诺）。
+    备份 = zip（config.json + 可选 products/ 目录）。"""
+    import zipfile
     cfg = load_config(args.dir)
-    # 备份 = 配置 + 产物清单（换设备迁移用）
-    backup = {"type": "suhui-config-backup", "config": cfg}
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(backup, f, ensure_ascii=False, indent=2)
-    print("备份已写入: %s" % args.out)
+    backup_path = args.out
+    with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("config.json", json.dumps(cfg, ensure_ascii=False, indent=2))
+        if args.products:
+            for prod in args.products:
+                if not os.path.isdir(prod):
+                    sys.stderr.write("跳过（非目录）: %s\n" % prod)
+                    continue
+                for root, _dirs, files in os.walk(prod):
+                    for fn in files:
+                        full = os.path.join(root, fn)
+                        zf.write(full, os.path.join(
+                            "products", os.path.basename(prod),
+                            os.path.relpath(full, prod)))
+    print("备份已写入: %s（含 config + %d 个产物目录）"
+          % (backup_path, len(args.products or [])))
     return 0
 
 
 def cmd_import_backup(args):
-    with open(args.infile, "r", encoding="utf-8") as f:
-        backup = json.load(f)
-    cfg = backup.get("config")
-    if not isinstance(cfg, dict):
-        sys.stderr.write("备份文件格式异常\n")
+    """恢复备份（config + 可选产物）。"""
+    import zipfile
+    if not zipfile.is_zipfile(args.infile):
+        sys.stderr.write("备份文件格式异常（应为 zip）\n")
         return 1
-    merged = dict(DEFAULTS)
-    merged.update({k: v for k, v in cfg.items() if k in DEFAULTS})
-    save_config(args.dir, merged)
+    with zipfile.ZipFile(args.infile, "r") as zf:
+        if "config.json" in zf.namelist():
+            cfg = json.loads(zf.read("config.json").decode("utf-8"))
+            if isinstance(cfg, dict):
+                merged = dict(DEFAULTS)
+                merged.update({k: v for k, v in cfg.items() if k in DEFAULTS})
+                save_config(args.dir, merged)
+        if args.restore_products:
+            os.makedirs(args.restore_products, exist_ok=True)
+            for name in zf.namelist():
+                if name.startswith("products/"):
+                    zf.extract(name, args.restore_products)
     print("备份已导入: %s" % os.path.join(args.dir, CONFIG_FILE))
     return 0
 
@@ -208,22 +230,18 @@ def main(argv=None):
     p.add_argument("version", choices=["pro", "flash"])
     p.set_defaults(fn=cmd_switch)
 
-    p = sub.add_parser("export-backup", help="设置备份（迁移用）")
+    p = sub.add_parser("export-backup", help="配置+产物备份（zip，迁移用）")
     p.add_argument("out")
+    p.add_argument("--products", nargs="*", default=[],
+                   help="额外打包的产物目录（可多个）")
     p.set_defaults(fn=cmd_export_backup)
 
     p = sub.add_parser("import-backup", help="恢复备份")
     p.add_argument("infile")
+    p.add_argument("--restore-products", default="",
+                   help="恢复产物到指定目录（备份含产物时）")
     p.set_defaults(fn=cmd_import_backup)
 
-    for subp in [a for a in ap._actions if hasattr(a, "choices") and a.dest == "cmd"]:
-        pass
-    for action in ap._actions:
-        if getattr(action, "option_strings", None):
-            continue
-        if action.dest == "cmd":
-            continue
-    # 给所有子命令加 --dir
     for name in ("init", "get", "set", "switch", "export-backup", "import-backup"):
         sub.choices[name].add_argument("--dir", default=".",
                                        help="配置目录（默认当前目录）")
