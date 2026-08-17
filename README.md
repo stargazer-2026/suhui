@@ -1,9 +1,9 @@
-# 溯洄 · 记忆蒸馏 skill（suhui — all new ex-skill）
+# 溯洄 · 记忆蒸馏 skill（suhui — all new memory skill）
 
 > 把一段聊天记录蒸馏成一个"记忆还活着的世界"。
 > 不是聊天机器人（那是"你问它答"），是"你回去"——打开它，像走进一间屋子，屋里有人正在生活。
 >
-> **Turn your chat history into an AI ex-skill** — a memory distillation skill that
+> **Turn your chat history into an AI memory skill** — a memory distillation skill that
 > remembers everything, keeps living, and lets you go back to any stage of your story.
 > Import WeChat / iMessage / Telegram / SMS / photos → Persona + Memories + World Tree.
 > MIT · local-first · open source.
