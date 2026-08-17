@@ -47,8 +47,7 @@
 
 兼容 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)：
 
-- 方式一：克隆/解压到 `~/.dsh/skills/suhui/`（dsh 的 skill-filesystem 直接解析 SKILL.md frontmatter）
-- 方式二：`dsh plugin add github:stargazer-2026/suhui-memory-skill`
+- 安装：克隆/解压到 `~/.dsh/skills/suhui/`（dsh 的 skill-filesystem 直接解析 SKILL.md frontmatter；本仓库为纯 SKILL.md 形态，无插件市场元数据，不走 `dsh plugin add`）
 
 ### 脚本路径（可选，需 API 密钥）
 
